@@ -26,7 +26,6 @@ export interface MailThreadRow {
   subject: string;
   status: MailThreadStatus;
   createdAt: string;
-  alertBody: string | null;
 }
 
 interface MailStateDbRow {
@@ -51,7 +50,6 @@ interface MailThreadDbRow {
   subject: string;
   status: string;
   created_at: string;
-  alert_body: string | null;
 }
 
 function fromMailStateRow(row: MailStateDbRow): MailStateRow {
@@ -81,7 +79,6 @@ function fromMailThreadRow(row: MailThreadDbRow): MailThreadRow {
     subject: row.subject,
     status: row.status as MailThreadStatus,
     createdAt: row.created_at,
-    alertBody: row.alert_body,
   };
 }
 
@@ -189,7 +186,6 @@ export interface CreateMailThreadArgs {
   account: string;
   subject: string;
   status?: MailThreadStatus;
-  alertBody?: string;
 }
 
 export function createMailThread(db: Database.Database, args: CreateMailThreadArgs): void {
@@ -207,8 +203,8 @@ export function createMailThread(db: Database.Database, args: CreateMailThreadAr
   const now = new Date().toISOString();
   const stmt = db.prepare(
     `INSERT INTO mail_threads
-       (discord_thread_id, gmail_msg_id, gmail_thread_id, account, subject, status, created_at, alert_body)
-     VALUES (@discordThreadId, @gmailMsgId, @gmailThreadId, @account, @subject, @status, @now, @alertBody)`,
+       (discord_thread_id, gmail_msg_id, gmail_thread_id, account, subject, status, created_at)
+     VALUES (@discordThreadId, @gmailMsgId, @gmailThreadId, @account, @subject, @status, @now)`,
   );
   stmt.run({
     discordThreadId: args.discordThreadId,
@@ -218,7 +214,6 @@ export function createMailThread(db: Database.Database, args: CreateMailThreadAr
     subject: args.subject,
     status,
     now,
-    alertBody: args.alertBody ?? null,
   });
 }
 
@@ -228,7 +223,7 @@ export function getMailThread(
 ): MailThreadRow | null {
   if (!discordThreadId) throw new Error('getMailThread: discordThreadId is required');
   const stmt = db.prepare<[string], MailThreadDbRow>(
-    `SELECT discord_thread_id, gmail_msg_id, gmail_thread_id, account, subject, status, created_at, alert_body
+    `SELECT discord_thread_id, gmail_msg_id, gmail_thread_id, account, subject, status, created_at
      FROM mail_threads WHERE discord_thread_id = ?`,
   );
   const row = stmt.get(discordThreadId);
@@ -241,7 +236,7 @@ export function getMailThreadByGmailMsg(
 ): MailThreadRow | null {
   if (!gmailMsgId) throw new Error('getMailThreadByGmailMsg: gmailMsgId is required');
   const stmt = db.prepare<[string], MailThreadDbRow>(
-    `SELECT discord_thread_id, gmail_msg_id, gmail_thread_id, account, subject, status, created_at, alert_body
+    `SELECT discord_thread_id, gmail_msg_id, gmail_thread_id, account, subject, status, created_at
      FROM mail_threads WHERE gmail_msg_id = ?`,
   );
   const row = stmt.get(gmailMsgId);

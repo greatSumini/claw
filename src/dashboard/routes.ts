@@ -49,7 +49,7 @@ const EVT_ERROR = 'error';
 // Helpers — HTML escaping & time formatting
 // ---------------------------------------------------------------------------
 
-function escapeHtml(s: string): string {
+export function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -69,7 +69,7 @@ const tsFormatter = new Intl.DateTimeFormat('en-CA', {
   hour12: false,
 });
 
-function fmtTs(iso: string | null | undefined): string {
+export function fmtTs(iso: string | null | undefined): string {
   if (!iso) return '—';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
@@ -81,7 +81,7 @@ function fmtTs(iso: string | null | undefined): string {
  * Returns ISO string of "today 00:00:00" in Asia/Seoul, expressed as UTC.
  * Used as a cutoff for "today's stats".
  */
-function startOfTodayKstIso(): string {
+export function startOfTodayKstIso(): string {
   // Get the current Y/M/D in Asia/Seoul, then build a UTC ISO that corresponds
   // to KST midnight (= UTC-1500 of that date... actually KST is UTC+9, so
   // KST midnight = previous-day 15:00 UTC).

@@ -50,11 +50,6 @@ export type ImportanceVerdict =
       suggestedActions: string[];
       contextNotes?: string;
     }
-  | {
-      /** 알림성 — 즉각 행동은 불필요하지만 알아두면 좋음 (영수증, 캘린더, 가입 확인, 시스템 알림 등). #inbox 채널로 라우팅. */
-      kind: 'notification';
-      oneLineSummary: string;
-    }
   | { kind: 'ambiguous'; oneLineSummary: string; reason: string }
   | { kind: 'ignore'; reason: string };
 

@@ -24,15 +24,7 @@ interface ClassifierIgnore {
   kind: 'ignore';
   reason: string;
 }
-interface ClassifierNotification {
-  kind: 'notification';
-  oneLineSummary: string;
-}
-type ClassifierOutput =
-  | ClassifierImportant
-  | ClassifierNotification
-  | ClassifierAmbiguous
-  | ClassifierIgnore;
+type ClassifierOutput = ClassifierImportant | ClassifierAmbiguous | ClassifierIgnore;
 
 function findRepoByChannelId(config: AppConfig, channelId: string): RepoEntry | undefined {
   return config.repoChannels.find((r) => r.channelId === channelId);
@@ -50,9 +42,8 @@ function buildClassifierPrompt(mail: MailSummary): string {
     '',
     '기준:',
     '- 중요/긴급(important): 명확한 답변·결정·조치가 필요한 비즈니스/개인 메일. 고객사·파트너·결제·계약·법무·일정 변경·urgent 등',
-    '- 알림성(notification): 즉각 행동은 불필요하나 알아두면 좋은 알림. 결제 영수증·은행 거래 알림·캘린더 알림·가입 확인·시스템 알림·트래커·구독 갱신 알림·배송 상태 등. 본인이 인지만 하면 됨.',
-    '- 모호(ambiguous): 중요·알림성·무시 어디인지 확신 어려움. 사람이 한 번 봐야 함',
-    '- 무시(ignore): 마케팅·뉴스레터·소셜미디어 활동 알림 등 안 봐도 되는 것',
+    '- 모호(ambiguous): 중요해 보이지만 확신 어려움. 사람이 한 번 봐야 함',
+    '- 무시(ignore): 마케팅·뉴스레터·자동알림·소셜 알림 등',
     '',
     `수신 계정: ${mail.account}`,
     `보낸이: ${mail.from}`,
@@ -63,8 +54,6 @@ function buildClassifierPrompt(mail: MailSummary): string {
     '',
     '출력 형식 — 정확히 한 줄, JSON만 (markdown fence 절대 금지):',
     '{"kind":"important","oneLineSummary":"<제목 요약 한 줄, 30자 이내>","suggestedActions":["<제안1>","<제안2>"],"contextNotes":"<있으면 기존 맥락 노트>"}',
-    '또는',
-    '{"kind":"notification","oneLineSummary":"<제목 요약 한 줄, 30자 이내>"}',
     '또는',
     '{"kind":"ambiguous","oneLineSummary":"<제목 요약>","reason":"<왜 모호한지>"}',
     '또는',
@@ -147,12 +136,6 @@ function parseClassifierOutput(raw: string): ClassifierOutput | null {
       suggestedActions: actions,
       contextNotes,
     };
-  }
-  if (kind === 'notification') {
-    if (typeof obj.oneLineSummary !== 'string' || obj.oneLineSummary.length === 0) {
-      return null;
-    }
-    return { kind: 'notification', oneLineSummary: obj.oneLineSummary };
   }
   if (kind === 'ambiguous') {
     if (typeof obj.oneLineSummary !== 'string' || obj.oneLineSummary.length === 0) {
@@ -270,7 +253,7 @@ export async function classifyMail(args: {
     };
   }
 
-  // 3. Whitelist promotion — whitelist trumps ignore/notification (always surface as important).
+  // 3. If whitelist and classifier said ignore — promote to ambiguous (whitelist trumps ignore).
   let verdict: ImportanceVerdict = parsed;
   if (policy?.policy === 'whitelist') {
     if (parsed.kind === 'ignore') {
@@ -279,13 +262,6 @@ export async function classifyMail(args: {
         oneLineSummary: mail.subject,
         suggestedActions: [],
         contextNotes: '발신자 화이트리스트 (분류기는 무시 판정)',
-      };
-    } else if (parsed.kind === 'notification') {
-      verdict = {
-        kind: 'important',
-        oneLineSummary: parsed.oneLineSummary,
-        suggestedActions: [],
-        contextNotes: '발신자 화이트리스트 (분류기는 알림성 판정)',
       };
     } else if (parsed.kind === 'important') {
       verdict = {

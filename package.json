@@ -12,7 +12,8 @@
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "migrate": "tsx src/state/migrate.ts"
+    "migrate": "tsx src/state/migrate.ts",
+    "test": "node --import tsx --test --test-reporter=spec src/__tests__/state.test.ts src/__tests__/discord-helpers.test.ts src/__tests__/gmail-helpers.test.ts src/__tests__/dashboard-helpers.test.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
@@ -30,5 +31,8 @@
     "@types/node": "^22.10.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
   }
 }

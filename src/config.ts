@@ -15,7 +15,6 @@ const Schema = z.object({
   DISCORD_CHANNEL_VMC_CONTEXT_HUB: z.string().min(1),
   DISCORD_CHANNEL_ARGOS: z.string().min(1),
   DISCORD_CHANNEL_VOOSTER: z.string().min(1),
-  DISCORD_CHANNEL_INBOX: z.string().min(1),
   DISCORD_OWNER_USER_ID: z.string().min(1),
 
   GMAIL_CLIENT_ID: z.string().optional().default(''),
@@ -65,10 +64,8 @@ export interface AppConfig {
   repoChannels: RepoEntry[];
   /** General channel — master claw, mention required */
   generalChannelId: string;
-  /** Channel where IMPORTANT/AMBIGUOUS mail alerts are posted (vmc-context-hub) */
+  /** Channel where mail alerts are posted (currently vmc-context-hub) */
   mailAlertChannelId: string;
-  /** Channel where NOTIFICATION-tier mail summaries are posted (#inbox) */
-  inboxChannelId: string;
   gmail: GmailAccount[];
   paths: {
     reposDir: string;
@@ -115,14 +112,6 @@ export function loadConfig(): AppConfig {
       category: 'code',
       description: 'Vooster-AI monorepo (turbo/pnpm workspace).',
     },
-    {
-      channelName: 'inbox',
-      channelId: env.DISCORD_CHANNEL_INBOX,
-      fullName: 'vibemafiaclub/context-hub',
-      localPath: path.join(env.REPOS_DIR, 'vibemafiaclub', 'context-hub'),
-      category: 'code',
-      description: '저우선·알림성 메일 받는 채널. 후속 답신은 vmc-context-hub repo 컨텍스트로 처리.',
-    },
   ];
 
   const gmail: GmailAccount[] = [
@@ -137,7 +126,6 @@ export function loadConfig(): AppConfig {
     repoChannels,
     generalChannelId: env.DISCORD_CHANNEL_GENERAL,
     mailAlertChannelId: env.DISCORD_CHANNEL_VMC_CONTEXT_HUB,
-    inboxChannelId: env.DISCORD_CHANNEL_INBOX,
     gmail,
     paths: {
       reposDir: env.REPOS_DIR,

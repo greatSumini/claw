@@ -568,24 +568,15 @@ export class GmailAdapter {
       return { alerted: false };
     }
 
-    // important / notification / ambiguous → post to Discord.
-    // Routing:
-    //   - notification → #inbox (light, no mention)
-    //   - important & ambiguous → #vmc-context-hub (full alert with mention)
+    // important or ambiguous → post to Discord.
     const oneLineSummary = verdict.oneLineSummary || subject;
     const body = this.buildAlertBody(verdict, mail);
-    const isNotification = verdict.kind === 'notification';
-    const targetChannelId = isNotification
-      ? this.config.inboxChannelId
-      : this.config.mailAlertChannelId;
-    const targetChannelName = isNotification ? 'inbox' : MAIL_ALERT_CHANNEL_NAME;
-    const threadEmoji = isNotification ? '📬' : '📩';
-    const threadName = truncateThreadName(`${threadEmoji} ${oneLineSummary}`, THREAD_NAME_MAX);
+    const threadName = truncateThreadName(`📩 ${oneLineSummary}`, THREAD_NAME_MAX);
 
     let posted: { threadId: string; firstMessageId: string };
     try {
       posted = await this.discord.postMailAlert({
-        channelId: targetChannelId,
+        channelId: this.config.mailAlertChannelId,
         threadName,
         initialMessage: body,
       });
@@ -596,13 +587,12 @@ export class GmailAdapter {
       );
       logEvent(this.db, {
         type: 'mail.error',
-        channel: targetChannelName,
+        channel: MAIL_ALERT_CHANNEL_NAME,
         summary: `discord post failed: ${subject}`,
         meta: {
           account: account.email,
           gmailMsgId: messageId,
           error: (err as Error).message,
-          targetChannel: targetChannelName,
         },
       });
       return { alerted: false };
@@ -615,7 +605,6 @@ export class GmailAdapter {
       account: mail.account,
       subject: mail.subject,
       status: 'awaiting_user',
-      alertBody: body,
     });
 
     const evtMeta = {
@@ -624,11 +613,10 @@ export class GmailAdapter {
       gmailThreadId: mail.threadId,
       verdict: verdict.kind,
       fromEmail,
-      targetChannel: targetChannelName,
     };
     logEvent(this.db, {
       type: 'mail.alert',
-      channel: targetChannelName,
+      channel: MAIL_ALERT_CHANNEL_NAME,
       threadId: posted.threadId,
       summary: oneLineSummary,
       meta: evtMeta,
@@ -636,7 +624,7 @@ export class GmailAdapter {
     emitEvent({
       ts: new Date().toISOString(),
       type: 'mail.alert',
-      channel: targetChannelName,
+      channel: MAIL_ALERT_CHANNEL_NAME,
       threadId: posted.threadId,
       summary: oneLineSummary,
       metaJson: JSON.stringify(evtMeta),
@@ -686,17 +674,6 @@ export class GmailAdapter {
       ].join('\n');
     }
 
-    if (verdict.kind === 'notification') {
-      const oneLine = verdict.oneLineSummary || subject;
-      // No @mention, no suggested-actions, just a clean summary.
-      return [
-        `📬 **${oneLine}**`,
-        `계정: ${accountLabel} · 발신: ${fromDisplay} · ${ts}`,
-        '',
-        snip,
-      ].join('\n');
-    }
-
     // ambiguous
     return [
       '**[모호] 중요·긴급 여부 확인 부탁**',
@@ -716,7 +693,6 @@ export class GmailAdapter {
       '[a] 중요/긴급 — 처리해주세요',
       '[b] 정보성 — 다음부터 비슷한 거 알리지 마세요',
       '[c] 이 발신자 앞으로 무시',
-      '[d] 알림성이니 #inbox로 (앞으로 비슷한 메일은 inbox로)',
     ].join('\n');
   }
 
