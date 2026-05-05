@@ -57,6 +57,12 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_events_type_ts ON events(type, ts);
     `,
   },
+  {
+    name: '002_mail_thread_alert_body',
+    sql: `
+      ALTER TABLE mail_threads ADD COLUMN alert_body TEXT;
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

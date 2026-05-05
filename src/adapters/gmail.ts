@@ -319,11 +319,18 @@ export class GmailAdapter {
   }
 
   private async doCycle(): Promise<void> {
+    const startedAt = Date.now();
+    let totalProcessed = 0;
+    let totalAlerted = 0;
+    let activeAccounts = 0;
     for (const rt of this.runtimes) {
       if (this.stopped) return;
       if (rt.disabled) continue;
+      activeAccounts++;
       try {
-        await this.pollAccount(rt);
+        const r = await this.pollAccount(rt);
+        totalProcessed += r.processed;
+        totalAlerted += r.alerted;
       } catch (err) {
         // pollAccount already does most error handling, but defense in depth:
         log.error(
@@ -332,6 +339,25 @@ export class GmailAdapter {
         );
       }
     }
+    const durationMs = Date.now() - startedAt;
+    const summary = `polled ${activeAccounts} accounts: processed=${totalProcessed} alerted=${totalAlerted} (${durationMs}ms)`;
+    logEvent(this.db, {
+      type: 'mail.poll',
+      channel: 'vmc-context-hub',
+      summary,
+      meta: {
+        accounts: activeAccounts,
+        processed: totalProcessed,
+        alerted: totalAlerted,
+        durationMs,
+      },
+    });
+    emitEvent({
+      ts: new Date().toISOString(),
+      type: 'mail.poll',
+      channel: 'vmc-context-hub',
+      summary,
+    });
   }
 
   private async pollAccount(
@@ -579,6 +605,7 @@ export class GmailAdapter {
       account: mail.account,
       subject: mail.subject,
       status: 'awaiting_user',
+      alertBody: body,
     });
 
     const evtMeta = {

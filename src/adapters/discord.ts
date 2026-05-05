@@ -13,6 +13,7 @@ import type { AppConfig, RepoEntry } from '../config.js';
 import { log } from '../log.js';
 import { runClaude, ClaudeError } from '../claude.js';
 import { getSession, upsertSession } from '../state/sessions.js';
+import { getMailThread } from '../state/mail.js';
 import { logEvent } from '../state/events.js';
 import { emitEvent } from '../dashboard/event-bus.js';
 import { routeDiscord } from '../orchestrator/router.js';
@@ -502,6 +503,32 @@ export class DiscordAdapter implements DiscordPoster {
 
     try {
       const userMessage = ctx.text;
+
+      // If this is the FIRST user reply in a mail-alert thread (no claude
+      // session yet AND a mail_threads row exists for this thread), inject
+      // the original alert body so claude has the mail context.
+      let promptForClaude = userMessage;
+      if (!resumeId && ctx.threadId) {
+        const mailThread = getMailThread(this.db, ctx.threadId);
+        if (mailThread?.alertBody) {
+          promptForClaude = [
+            '아래는 이 thread의 발단이 된 메일 알림 본문입니다 (참고 컨텍스트):',
+            '',
+            '---',
+            mailThread.alertBody,
+            '---',
+            '',
+            '위 메일에 대해 사용자가 다음과 같이 답합니다:',
+            '',
+            userMessage,
+          ].join('\n');
+          log.info(
+            { threadId: ctx.threadId, gmailMsgId: mailThread.gmailMsgId },
+            'mail context injected into first reply prompt',
+          );
+        }
+      }
+
       const systemAppend = buildRepoWorkSystemAppend({
         userMessage,
         repo,
@@ -527,7 +554,7 @@ export class DiscordAdapter implements DiscordPoster {
       try {
         result = await runClaude({
           cwd: repo.localPath,
-          prompt: userMessage,
+          prompt: promptForClaude,
           systemAppend,
           resume: resumeId,
           timeoutMs: CLAUDE_TIMEOUT_MS,
