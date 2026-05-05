@@ -1,0 +1,772 @@
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  Partials,
+  type Channel,
+  type Message,
+  type TextBasedChannel,
+} from 'discord.js';
+import type Database from 'better-sqlite3';
+
+import type { AppConfig, RepoEntry } from '../config.js';
+import { log } from '../log.js';
+import { runClaude, ClaudeError } from '../claude.js';
+import { getSession, upsertSession } from '../state/sessions.js';
+import { logEvent } from '../state/events.js';
+import { emitEvent } from '../dashboard/event-bus.js';
+import { routeDiscord } from '../orchestrator/router.js';
+import { buildRepoWorkSystemAppend } from '../orchestrator/prompt.js';
+import type { DiscordMessageContext } from '../orchestrator/types.js';
+
+// ---------------------------------------------------------------------------
+// Public surface
+// ---------------------------------------------------------------------------
+
+export interface DiscordPoster {
+  /**
+   * Post a mail alert to a channel. If posted to a repo channel that
+   * auto-creates threads, returns that thread ID. Returns the first
+   * message ID for reference.
+   */
+  postMailAlert(args: {
+    channelId: string;
+    threadName: string;
+    initialMessage: string;
+  }): Promise<{ threadId: string; firstMessageId: string }>;
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const DISCORD_MESSAGE_HARD_LIMIT = 2000;
+const SAFE_CHUNK_SIZE = 1900; // headroom for the [i/N]\n prefix
+const THREAD_NAME_MAX = 90; // Discord limit is 100; leave headroom
+const DEFAULT_AUTO_ARCHIVE_MIN = 1440;
+const TYPING_REFRESH_MS = 9_000;
+const CLAUDE_TIMEOUT_MS = 600_000;
+
+// ---------------------------------------------------------------------------
+// Helpers (exported for shape testing)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a thread title from a user message:
+ * - Strip leading mentions/punctuation
+ * - Take the first sentence-ish chunk
+ * - Sanitize newlines
+ * - Truncate to THREAD_NAME_MAX (Discord limit is 100; headroom kept)
+ */
+export function makeThreadTitle(content: string): string {
+  let s = (content ?? '').trim();
+  // Strip leading user/role mentions (`<@123>`, `<@!123>`, `<@&123>`).
+  s = s.replace(/^(?:<@[!&]?\d+>\s*)+/, '');
+  // Strip leading punctuation.
+  s = s.replace(/^[\s\p{P}]+/u, '');
+  // Replace any whitespace runs (incl. newlines) with single space.
+  s = s.replace(/\s+/g, ' ');
+  // Take up to first sentence-end if reasonably short.
+  const sentenceMatch = s.match(/^(.+?[.!?。！？])\s/);
+  if (sentenceMatch && sentenceMatch[1].length <= THREAD_NAME_MAX) {
+    s = sentenceMatch[1];
+  }
+  s = s.trim();
+  if (s.length === 0) return 'untitled';
+  if (s.length <= THREAD_NAME_MAX) return s;
+  return s.slice(0, THREAD_NAME_MAX - 1).trimEnd() + '…';
+}
+
+/**
+ * Robust message splitter:
+ * - Try to split on paragraph (`\n\n`), then line (`\n`), then sentence (`. `), then char count
+ * - Keep code fences balanced across chunks (close ``` on cut, reopen with same language on next)
+ * - Each chunk ≤ maxLen
+ * - If N > 1, prefix each chunk with `[i/N]\n`
+ */
+export function splitMessage(text: string, maxLen: number = SAFE_CHUNK_SIZE): string[] {
+  if (typeof text !== 'string') {
+    throw new Error('splitMessage: text must be a string');
+  }
+  if (!Number.isInteger(maxLen) || maxLen <= 0) {
+    throw new Error('splitMessage: maxLen must be a positive integer');
+  }
+
+  const trimmed = text;
+  if (trimmed.length === 0) return [''];
+
+  // Reserve room for the "[i/N]\n" prefix in worst case. We don't know N up front,
+  // so we conservatively reserve up to "[99/99]\n" → 8 chars.
+  const PREFIX_RESERVE = 8;
+  const bodyMax = Math.max(1, maxLen - PREFIX_RESERVE);
+
+  // Greedy splitter that prefers breaking on better separators.
+  const rawChunks: string[] = [];
+  let remaining = trimmed;
+
+  while (remaining.length > bodyMax) {
+    const window = remaining.slice(0, bodyMax);
+
+    let cutAt = -1;
+    // Prefer paragraph break.
+    const paraIdx = window.lastIndexOf('\n\n');
+    if (paraIdx > bodyMax * 0.4) cutAt = paraIdx + 2;
+    if (cutAt === -1) {
+      const lineIdx = window.lastIndexOf('\n');
+      if (lineIdx > bodyMax * 0.4) cutAt = lineIdx + 1;
+    }
+    if (cutAt === -1) {
+      const sentIdx = window.lastIndexOf('. ');
+      if (sentIdx > bodyMax * 0.4) cutAt = sentIdx + 2;
+    }
+    if (cutAt === -1) cutAt = bodyMax; // hard cut
+
+    rawChunks.push(remaining.slice(0, cutAt));
+    remaining = remaining.slice(cutAt);
+  }
+  if (remaining.length > 0 || rawChunks.length === 0) {
+    rawChunks.push(remaining);
+  }
+
+  // Re-balance code fences across chunks.
+  const balanced: string[] = [];
+  let openLang: string | null = null; // language tag of an unclosed fence carried over
+  for (const chunkRaw of rawChunks) {
+    // Scan the *raw* chunk content for fences, starting from carried-over state.
+    const fenceRegex = /```([^\n`]*)\n?/g;
+    let m: RegExpExecArray | null;
+    let state: string | null = openLang;
+    while ((m = fenceRegex.exec(chunkRaw)) !== null) {
+      if (state === null) {
+        // Opening fence: capture language tag (may be empty).
+        state = (m[1] ?? '').trim();
+      } else {
+        // Closing fence.
+        state = null;
+      }
+    }
+
+    let chunk = chunkRaw;
+    // If we entered this chunk inside an open fence, prepend a continuation fence.
+    if (openLang !== null) {
+      chunk = '```' + openLang + '\n' + chunk;
+    }
+    // If we exited still inside an open fence, close it for this chunk.
+    if (state !== null) {
+      chunk = chunk.replace(/\s+$/, '') + '\n```';
+    }
+    openLang = state;
+    balanced.push(chunk);
+  }
+
+  // Apply [i/N]\n prefix when more than one chunk.
+  const N = balanced.length;
+  if (N <= 1) return balanced;
+  const out = balanced.map((c, i) => `[${i + 1}/${N}]\n${c}`);
+
+  // Final safety: enforce maxLen by hard-trimming if any chunk overshoots.
+  return out.map((c) => (c.length <= maxLen ? c : c.slice(0, maxLen)));
+}
+
+/** Truncate a string to `max` characters using a horizontal ellipsis when shortened. */
+export function truncate(s: string, max: number): string {
+  if (typeof s !== 'string') return '';
+  if (max <= 0) return '';
+  if (s.length <= max) return s;
+  if (max <= 1) return s.slice(0, max);
+  return s.slice(0, max - 1).trimEnd() + '…';
+}
+
+// ---------------------------------------------------------------------------
+// Adapter
+// ---------------------------------------------------------------------------
+
+interface DiscordAdapterOpts {
+  config: AppConfig;
+  db: Database.Database;
+}
+
+export class DiscordAdapter implements DiscordPoster {
+  private readonly config: AppConfig;
+  private readonly db: Database.Database;
+  private readonly client: Client;
+  /** Per-thread (or per-channel for DMs) mutex chain. */
+  private readonly threadLocks: Map<string, Promise<void>> = new Map();
+  private started = false;
+  private stopped = false;
+
+  constructor(opts: DiscordAdapterOpts) {
+    if (!opts || !opts.config) throw new Error('DiscordAdapter: config required');
+    if (!opts.db) throw new Error('DiscordAdapter: db required');
+    this.config = opts.config;
+    this.db = opts.db;
+    this.client = new Client({
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.DirectMessages,
+      ],
+      partials: [Partials.Channel, Partials.Message],
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Lifecycle
+  // -------------------------------------------------------------------------
+
+  async start(): Promise<void> {
+    if (this.started) return;
+    this.started = true;
+
+    this.client.on(Events.MessageCreate, (msg) => {
+      void this.onMessage(msg).catch((err) => {
+        log.error(
+          { err: (err as Error).message, stack: (err as Error).stack },
+          'discord onMessage handler crashed',
+        );
+      });
+    });
+
+    this.client.on(Events.ShardError, (err, shardId) => {
+      log.error({ err: err.message, shardId }, 'discord shard error');
+    });
+
+    this.client.on(Events.ShardDisconnect, (closeEvent, shardId) => {
+      log.warn(
+        { shardId, code: closeEvent?.code, reason: closeEvent?.reason },
+        'discord shard disconnected',
+      );
+    });
+
+    this.client.on(Events.Error, (err) => {
+      log.error({ err: err.message }, 'discord client error');
+    });
+
+    let rejectReady: ((err: Error) => void) | null = null;
+    const ready = new Promise<void>((resolve, reject) => {
+      rejectReady = reject;
+      const onReady = (): void => {
+        log.info(
+          { user: this.client.user?.tag ?? '(unknown)' },
+          'Discord ready',
+        );
+        resolve();
+      };
+      // Newer discord.js (v14.16+) renamed 'ready' → 'clientReady'.
+      this.client.once(Events.ClientReady, onReady);
+    });
+
+    try {
+      await Promise.all([
+        this.client.login(this.config.env.DISCORD_BOT_TOKEN).then(
+          () => undefined,
+          (err: Error) => {
+            if (rejectReady) rejectReady(err);
+            throw err;
+          },
+        ),
+        ready,
+      ]);
+    } catch (err) {
+      this.started = false;
+      throw err;
+    }
+  }
+
+  async stop(): Promise<void> {
+    if (!this.started || this.stopped) return;
+    this.stopped = true;
+    try {
+      this.client.removeAllListeners();
+      await this.client.destroy();
+    } finally {
+      log.info('Discord stopped');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Message handling
+  // -------------------------------------------------------------------------
+
+  private async onMessage(msg: Message): Promise<void> {
+    // Defense-in-depth filters.
+    if (msg.author?.bot) return;
+    if (!this.client.user) return; // not ready yet
+    if (msg.author.id === this.client.user.id) return;
+    const ownerId = this.config.env.DISCORD_OWNER_USER_ID;
+    if (msg.author.id !== ownerId) {
+      // Quietly drop — Discord ACL is the real gate.
+      return;
+    }
+
+    const ctx = await this.buildContext(msg);
+
+    // Log inbound. (Don't double-log; routeDiscord logs router decisions.)
+    logEvent(this.db, {
+      type: 'discord.message.in',
+      channel: ctx.channelName ?? ctx.channelId,
+      threadId: ctx.threadId ?? undefined,
+      summary: ctx.text.slice(0, 200),
+      meta: {
+        authorId: ctx.authorId,
+        isMention: ctx.isMention,
+        isDm: ctx.isDm === true,
+      },
+    });
+    emitEvent({
+      ts: new Date().toISOString(),
+      type: 'discord.message.in',
+      channel: ctx.channelName ?? ctx.channelId,
+      threadId: ctx.threadId ?? undefined,
+      summary: ctx.text.slice(0, 200),
+    });
+
+    let decision;
+    try {
+      decision = await routeDiscord({ ctx, config: this.config, db: this.db });
+    } catch (err) {
+      log.error(
+        { err: (err as Error).message, channel: ctx.channelName ?? ctx.channelId },
+        'routeDiscord crashed',
+      );
+      return;
+    }
+
+    switch (decision.kind) {
+      case 'ignore':
+        log.debug(
+          { channel: ctx.channelName ?? ctx.channelId, reason: decision.reason },
+          'discord message ignored',
+        );
+        return;
+      case 'trivial': {
+        try {
+          await msg.reply(truncate(decision.answer, DISCORD_MESSAGE_HARD_LIMIT));
+        } catch (err) {
+          log.error({ err: (err as Error).message }, 'failed to send trivial reply');
+        }
+        logEvent(this.db, {
+          type: 'discord.message.out',
+          channel: ctx.channelName ?? ctx.channelId,
+          threadId: ctx.threadId ?? undefined,
+          summary: decision.answer.slice(0, 200),
+          meta: { mode: 'trivial' },
+        });
+        emitEvent({
+          ts: new Date().toISOString(),
+          type: 'discord.message.out',
+          channel: ctx.channelName ?? ctx.channelId,
+          threadId: ctx.threadId ?? undefined,
+          summary: decision.answer.slice(0, 200),
+        });
+        return;
+      }
+      case 'repo-work':
+        await this.handleRepoWork(msg, ctx, decision.repo, decision.instructions);
+        return;
+      default: {
+        // Exhaustiveness guard.
+        const _exhaustive: never = decision;
+        return _exhaustive;
+      }
+    }
+  }
+
+  private async buildContext(msg: Message): Promise<DiscordMessageContext> {
+    const channel = msg.channel;
+    const isDm = channel.isDMBased();
+    const isThread = channel.isThread();
+
+    let channelName: string | undefined;
+    if (isDm) {
+      channelName = 'dm';
+    } else if (isThread) {
+      // Thread name; fall back to parent channel registered name.
+      const parentId = channel.parentId ?? '';
+      const registered = this.config.repoChannels.find((r) => r.channelId === parentId);
+      channelName =
+        ('name' in channel && typeof channel.name === 'string' ? channel.name : undefined) ??
+        registered?.channelName;
+    } else {
+      const registered = this.config.repoChannels.find((r) => r.channelId === channel.id);
+      channelName =
+        ('name' in channel && typeof channel.name === 'string' ? channel.name : undefined) ??
+        registered?.channelName ??
+        (channel.id === this.config.generalChannelId ? 'general' : undefined);
+    }
+
+    const ourId = this.client.user?.id ?? '';
+    const isMention =
+      (ourId !== '' && msg.mentions.users.has(ourId)) ||
+      msg.mentions.repliedUser?.id === ourId;
+
+    const cleanedText = stripLeadingMention(msg.content ?? '', ourId);
+
+    // For routing: channelId is the *parent* channel ID when in a thread,
+    // so repo-locked classification works. The thread ID is tracked separately.
+    let routingChannelId: string;
+    let threadId: string | null;
+    if (isDm) {
+      routingChannelId = channel.id;
+      threadId = null;
+    } else if (isThread) {
+      routingChannelId = channel.parentId ?? channel.id;
+      threadId = channel.id;
+    } else {
+      routingChannelId = channel.id;
+      threadId = null;
+    }
+
+    const attachments = Array.from(msg.attachments.values()).map((a) => ({
+      name: a.name ?? 'attachment',
+      url: a.url,
+    }));
+
+    return {
+      channelId: routingChannelId,
+      channelName,
+      threadId,
+      authorId: msg.author.id,
+      authorName: msg.author.username ?? msg.author.id,
+      text: cleanedText,
+      isMention,
+      isDm,
+      isBot: false,
+      attachments,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Repo-work flow
+  // -------------------------------------------------------------------------
+
+  private async handleRepoWork(
+    msg: Message,
+    ctx: DiscordMessageContext,
+    repo: RepoEntry,
+    _instructions: string | undefined,
+  ): Promise<void> {
+    const channel = msg.channel;
+    const isDm = channel.isDMBased();
+    const isThread = channel.isThread();
+
+    // 1. Determine target channel/thread + session key.
+    let target: TargetChannel;
+    let threadKey: string;
+    try {
+      if (isDm) {
+        target = { kind: 'channel', channel: channel as TextSendable };
+        threadKey = channel.id;
+      } else if (isThread) {
+        target = { kind: 'channel', channel: channel as TextSendable };
+        threadKey = channel.id;
+      } else {
+        // Top-level message in a repo or general channel: open a thread.
+        const title = makeThreadTitle(ctx.text || repo.fullName);
+        const newThread = await msg.startThread({
+          name: truncate(title, THREAD_NAME_MAX),
+          autoArchiveDuration: DEFAULT_AUTO_ARCHIVE_MIN,
+        });
+        target = { kind: 'channel', channel: newThread as unknown as TextSendable };
+        threadKey = newThread.id;
+      }
+    } catch (err) {
+      log.error(
+        { err: (err as Error).message, channel: ctx.channelName ?? ctx.channelId },
+        'failed to resolve discord target / open thread',
+      );
+      return;
+    }
+
+    // 2. Per-thread mutex.
+    await this.runWithMutex(threadKey, () =>
+      this.runRepoWorkInThread(ctx, repo, target, threadKey),
+    );
+  }
+
+  private async runRepoWorkInThread(
+    ctx: DiscordMessageContext,
+    repo: RepoEntry,
+    target: TargetChannel,
+    threadKey: string,
+  ): Promise<void> {
+    const channelLabel = ctx.channelName ?? ctx.channelId;
+
+    // Look up existing claude session.
+    const sessionRow = getSession(this.db, threadKey);
+    const resumeId = sessionRow?.claudeSessionId;
+
+    // Typing indicator — refresh every 9s.
+    const stopTyping = startTyping(target.channel);
+
+    try {
+      const userMessage = ctx.text;
+      const systemAppend = buildRepoWorkSystemAppend({
+        userMessage,
+        repo,
+        isContinuation: Boolean(resumeId),
+      });
+
+      logEvent(this.db, {
+        type: 'claude.invoke',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `repo=${repo.fullName} resume=${Boolean(resumeId)}`,
+        meta: { repo: repo.fullName, resume: Boolean(resumeId) },
+      });
+      emitEvent({
+        ts: new Date().toISOString(),
+        type: 'claude.invoke',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `repo=${repo.fullName} resume=${Boolean(resumeId)}`,
+      });
+
+      let result;
+      try {
+        result = await runClaude({
+          cwd: repo.localPath,
+          prompt: userMessage,
+          systemAppend,
+          resume: resumeId,
+          timeoutMs: CLAUDE_TIMEOUT_MS,
+        });
+      } catch (err) {
+        const e = err instanceof ClaudeError ? err : (err as Error);
+        log.error(
+          { err: e.message, channel: channelLabel, threadId: threadKey, repo: repo.fullName },
+          'claude run failed in repo-work',
+        );
+        logEvent(this.db, {
+          type: 'claude.error',
+          channel: channelLabel,
+          threadId: threadKey,
+          summary: e.message.slice(0, 300),
+          meta: { repo: repo.fullName },
+        });
+        emitEvent({
+          ts: new Date().toISOString(),
+          type: 'claude.error',
+          channel: channelLabel,
+          threadId: threadKey,
+          summary: e.message.slice(0, 300),
+        });
+        try {
+          await safeSend(target.channel, `claude run failed: ${truncate(e.message, 1500)}`);
+        } catch (sendErr) {
+          log.error(
+            { err: (sendErr as Error).message },
+            'failed to post claude error message',
+          );
+        }
+        return;
+      }
+
+      // Post the response.
+      const chunks = splitMessage(result.text, SAFE_CHUNK_SIZE);
+      for (const chunk of chunks) {
+        try {
+          await safeSend(target.channel, chunk);
+        } catch (err) {
+          log.error(
+            { err: (err as Error).message, channel: channelLabel, threadId: threadKey },
+            'failed to send response chunk',
+          );
+          break;
+        }
+      }
+
+      // Persist session.
+      try {
+        upsertSession(this.db, {
+          threadId: threadKey,
+          claudeSessionId: result.sessionId,
+          repo: repo.fullName,
+          cwd: repo.localPath,
+        });
+      } catch (err) {
+        log.error(
+          { err: (err as Error).message, threadId: threadKey },
+          'failed to upsert session',
+        );
+      }
+
+      // Result + outbound logs.
+      logEvent(this.db, {
+        type: 'claude.result',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `${result.durationMs}ms ${result.text.length}chars`,
+        meta: { duration_seconds: result.durationMs / 1000, repo: repo.fullName },
+      });
+      emitEvent({
+        ts: new Date().toISOString(),
+        type: 'claude.result',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `${result.durationMs}ms ${result.text.length}chars`,
+      });
+
+      logEvent(this.db, {
+        type: 'discord.message.out',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: result.text.slice(0, 200),
+        meta: { chunks: chunks.length },
+      });
+      emitEvent({
+        ts: new Date().toISOString(),
+        type: 'discord.message.out',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: result.text.slice(0, 200),
+      });
+    } finally {
+      stopTyping();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Mutex
+  // -------------------------------------------------------------------------
+
+  private async runWithMutex(key: string, work: () => Promise<void>): Promise<void> {
+    const prev = this.threadLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const myPromise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.threadLocks.set(key, myPromise);
+
+    try {
+      await prev;
+    } catch {
+      // Previous job's failure shouldn't block our turn.
+    }
+
+    try {
+      await work();
+    } finally {
+      release();
+      // Only delete if we're still the head of the chain.
+      if (this.threadLocks.get(key) === myPromise) {
+        this.threadLocks.delete(key);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // postMailAlert (DiscordPoster)
+  // -------------------------------------------------------------------------
+
+  async postMailAlert(args: {
+    channelId: string;
+    threadName: string;
+    initialMessage: string;
+  }): Promise<{ threadId: string; firstMessageId: string }> {
+    if (!args || typeof args.channelId !== 'string' || args.channelId.length === 0) {
+      throw new Error('postMailAlert: channelId required');
+    }
+    if (typeof args.threadName !== 'string' || args.threadName.length === 0) {
+      throw new Error('postMailAlert: threadName required');
+    }
+    if (typeof args.initialMessage !== 'string') {
+      throw new Error('postMailAlert: initialMessage required');
+    }
+
+    const channel: Channel | null = await this.client.channels.fetch(args.channelId);
+    if (!channel) {
+      throw new Error(`postMailAlert: channel ${args.channelId} not found`);
+    }
+    if (!channel.isTextBased() || !('send' in channel) || typeof (channel as { send?: unknown }).send !== 'function') {
+      throw new Error(`postMailAlert: channel ${args.channelId} is not text-sendable`);
+    }
+    const sendable = channel as unknown as TextSendable;
+
+    const chunks = splitMessage(args.initialMessage, SAFE_CHUNK_SIZE);
+    const firstMsg = await sendable.send(chunks[0] ?? '');
+
+    const truncatedName = truncate(args.threadName, THREAD_NAME_MAX);
+    const thread = await firstMsg.startThread({
+      name: truncatedName,
+      autoArchiveDuration: DEFAULT_AUTO_ARCHIVE_MIN,
+    });
+
+    for (const chunk of chunks.slice(1)) {
+      try {
+        await thread.send(chunk);
+      } catch (err) {
+        log.error(
+          { err: (err as Error).message, threadId: thread.id },
+          'postMailAlert: failed to send follow-up chunk',
+        );
+        // Continue trying remaining chunks rather than abort entirely.
+      }
+    }
+
+    return { threadId: thread.id, firstMessageId: firstMsg.id };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal duck type for any channel/thread we can `send` to and request typing on.
+ * This avoids verbose discord.js conditional typing in our flow.
+ */
+interface TextSendable {
+  send(content: string): Promise<Message>;
+  sendTyping(): Promise<void>;
+  id: string;
+}
+
+interface TargetChannel {
+  kind: 'channel';
+  channel: TextSendable;
+}
+
+function startTyping(channel: TextSendable): () => void {
+  let cancelled = false;
+  let timer: NodeJS.Timeout | null = null;
+
+  const fire = (): void => {
+    if (cancelled) return;
+    channel.sendTyping().catch((err) => {
+      log.debug({ err: (err as Error).message }, 'sendTyping failed');
+    });
+    if (cancelled) return;
+    timer = setTimeout(fire, TYPING_REFRESH_MS);
+    // Don't keep the event loop alive on shutdown.
+    if (timer && typeof timer.unref === 'function') timer.unref();
+  };
+
+  fire();
+
+  return () => {
+    cancelled = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+}
+
+async function safeSend(channel: TextSendable, content: string): Promise<void> {
+  // Discord rejects empty content, so substitute a single space if needed.
+  const payload = content.length === 0 ? ' ' : content;
+  await channel.send(payload);
+}
+
+function stripLeadingMention(text: string, botUserId: string): string {
+  if (!text) return '';
+  if (!botUserId) return text.trim();
+  // Strip one or more leading mentions of the bot (with or without `!`).
+  const re = new RegExp(`^(?:<@!?${botUserId}>\\s*)+`);
+  return text.replace(re, '').trim();
+}
+
+// Re-export types for downstream consumers (e.g. gmail adapter).
+export type { TextBasedChannel };
