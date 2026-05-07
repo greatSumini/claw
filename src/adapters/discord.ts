@@ -23,6 +23,7 @@ import {
   CLAW_RESTART_MARKER,
 } from '../orchestrator/prompt.js';
 import type { DiscordMessageContext } from '../orchestrator/types.js';
+import { downloadAttachments, attachmentNote } from '../attachments.js';
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -509,7 +510,8 @@ export class DiscordAdapter implements DiscordPoster {
     const stopTyping = startTyping(target.channel);
 
     try {
-      const userMessage = ctx.text;
+      const savedPaths = await downloadAttachments(ctx.attachments ?? []);
+      const userMessage = ctx.text + attachmentNote(savedPaths);
       const systemAppend = buildRepoWorkSystemAppend({
         userMessage,
         repo,
@@ -688,7 +690,8 @@ export class DiscordAdapter implements DiscordPoster {
     const stopTyping = startTyping(target.channel);
 
     try {
-      const userMessage = ctx.text;
+      const savedPaths = await downloadAttachments(ctx.attachments ?? []);
+      const userMessage = ctx.text + attachmentNote(savedPaths);
       const systemAppend = buildClawMaintenanceSystemAppend({
         isContinuation: Boolean(resumeId),
       });
