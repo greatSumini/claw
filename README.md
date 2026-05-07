@@ -67,7 +67,30 @@ node dist/server.js      # 또는 launchd로 데몬화
 
 ## 데몬 (macOS)
 
-`scripts/com.claw.plist` (생성됨) 참고. `launchctl bootstrap`으로 로그인 시 자동 시작.
+`~/Library/LaunchAgents/com.claw.plist`로 등록되어 로그인 시 자동 시작 (`KeepAlive: true` — 죽으면 자동 재시작). `dist/server.js`를 실행하므로 코드 수정 후엔 **빌드부터** 해야 반영된다.
+
+### 코드 수정 후 재실행
+
+**프로덕션 (launchd 유지)**
+```bash
+pnpm build && launchctl kickstart -k gui/$(id -u)/com.claw
+```
+- 로그: `tail -f logs/launchd.log logs/launchd.error.log`
+
+**개발 모드 (파일 저장 시 자동 재시작)**
+```bash
+launchctl bootout gui/$(id -u)/com.claw         # launchd 잠시 끄기
+pnpm dev                                         # tsx watch
+# 끝나면 다시 살리기:
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claw.plist
+```
+
+### 상태 확인
+
+```bash
+launchctl list | grep com.claw    # PID, exit code
+lsof -i :3200                     # 포트 LISTEN 여부
+```
 
 ## 다른 머신에서 적용 (요약)
 
