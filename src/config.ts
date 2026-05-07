@@ -15,6 +15,7 @@ const Schema = z.object({
   DISCORD_CHANNEL_VMC_CONTEXT_HUB: z.string().min(1),
   DISCORD_CHANNEL_ARGOS: z.string().min(1),
   DISCORD_CHANNEL_VOOSTER: z.string().min(1),
+  DISCORD_CHANNEL_CLAW: z.string().min(1),
   DISCORD_OWNER_USER_ID: z.string().min(1),
 
   GMAIL_CLIENT_ID: z.string().optional().default(''),
@@ -66,6 +67,10 @@ export interface AppConfig {
   generalChannelId: string;
   /** Channel where mail alerts are posted (currently vmc-context-hub) */
   mailAlertChannelId: string;
+  /** claw 자체 유지보수 전용 채널 — 인입 메시지를 claw repo에서 직접 작업 */
+  clawChannelId: string;
+  /** claw repo의 로컬 체크아웃 경로 */
+  clawRepoPath: string;
   gmail: GmailAccount[];
   paths: {
     reposDir: string;
@@ -126,6 +131,8 @@ export function loadConfig(): AppConfig {
     repoChannels,
     generalChannelId: env.DISCORD_CHANNEL_GENERAL,
     mailAlertChannelId: env.DISCORD_CHANNEL_VMC_CONTEXT_HUB,
+    clawChannelId: env.DISCORD_CHANNEL_CLAW,
+    clawRepoPath: path.join(env.REPOS_DIR, 'greatSumini', 'claw'),
     gmail,
     paths: {
       reposDir: env.REPOS_DIR,

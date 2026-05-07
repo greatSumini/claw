@@ -187,6 +187,18 @@ export async function routeDiscord(args: {
     return { kind: 'repo-work', repo: repoLocked };
   }
 
+  // 2a. claw 자체 유지보수 채널 → claw repo에서 직접 작업.
+  if (ctx.channelId === config.clawChannelId) {
+    logEvent(db, {
+      type: 'router.classify',
+      channel: ctx.channelId,
+      threadId: ctx.threadId ?? undefined,
+      summary: 'claw-maintenance (channel-locked)',
+      meta: { mode: 'channel-locked', target: 'claw' },
+    });
+    return { kind: 'claw-maintenance' };
+  }
+
   const isGeneral = ctx.channelId === config.generalChannelId;
   const isDm = ctx.isDm === true;
 

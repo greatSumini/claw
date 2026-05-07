@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import {
   Client,
   Events,
@@ -16,7 +17,11 @@ import { getSession, upsertSession } from '../state/sessions.js';
 import { logEvent } from '../state/events.js';
 import { emitEvent } from '../dashboard/event-bus.js';
 import { routeDiscord } from '../orchestrator/router.js';
-import { buildRepoWorkSystemAppend } from '../orchestrator/prompt.js';
+import {
+  buildRepoWorkSystemAppend,
+  buildClawMaintenanceSystemAppend,
+  CLAW_RESTART_MARKER,
+} from '../orchestrator/prompt.js';
 import type { DiscordMessageContext } from '../orchestrator/types.js';
 
 // ---------------------------------------------------------------------------
@@ -365,6 +370,9 @@ export class DiscordAdapter implements DiscordPoster {
       case 'repo-work':
         await this.handleRepoWork(msg, ctx, decision.repo, decision.instructions);
         return;
+      case 'claw-maintenance':
+        await this.handleClawMaintenance(msg, ctx);
+        return;
       default: {
         // Exhaustiveness guard.
         const _exhaustive: never = decision;
@@ -628,6 +636,195 @@ export class DiscordAdapter implements DiscordPoster {
   }
 
   // -------------------------------------------------------------------------
+  // Claw self-maintenance flow
+  // -------------------------------------------------------------------------
+
+  private async handleClawMaintenance(
+    msg: Message,
+    ctx: DiscordMessageContext,
+  ): Promise<void> {
+    const channel = msg.channel;
+    const isThread = channel.isThread();
+
+    let target: TargetChannel;
+    let threadKey: string;
+    try {
+      if (isThread) {
+        target = { kind: 'channel', channel: channel as TextSendable };
+        threadKey = channel.id;
+      } else {
+        const title = makeThreadTitle(ctx.text || 'claw 유지보수');
+        const newThread = await msg.startThread({
+          name: truncate(title, THREAD_NAME_MAX),
+          autoArchiveDuration: DEFAULT_AUTO_ARCHIVE_MIN,
+        });
+        target = { kind: 'channel', channel: newThread as unknown as TextSendable };
+        threadKey = newThread.id;
+      }
+    } catch (err) {
+      log.error(
+        { err: (err as Error).message, channel: ctx.channelName ?? ctx.channelId },
+        'failed to resolve discord target / open thread (claw-maintenance)',
+      );
+      return;
+    }
+
+    await this.runWithMutex(threadKey, () =>
+      this.runClawMaintenanceInThread(ctx, target, threadKey),
+    );
+  }
+
+  private async runClawMaintenanceInThread(
+    ctx: DiscordMessageContext,
+    target: TargetChannel,
+    threadKey: string,
+  ): Promise<void> {
+    const channelLabel = ctx.channelName ?? ctx.channelId;
+    const cwd = this.config.clawRepoPath;
+
+    const sessionRow = getSession(this.db, threadKey);
+    const resumeId = sessionRow?.claudeSessionId;
+
+    const stopTyping = startTyping(target.channel);
+
+    try {
+      const userMessage = ctx.text;
+      const systemAppend = buildClawMaintenanceSystemAppend({
+        isContinuation: Boolean(resumeId),
+      });
+
+      logEvent(this.db, {
+        type: 'claude.invoke',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `claw-maintenance resume=${Boolean(resumeId)}`,
+        meta: { target: 'claw', resume: Boolean(resumeId) },
+      });
+      emitEvent({
+        ts: new Date().toISOString(),
+        type: 'claude.invoke',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `claw-maintenance resume=${Boolean(resumeId)}`,
+      });
+
+      let result;
+      try {
+        result = await runClaude({
+          cwd,
+          prompt: userMessage,
+          systemAppend,
+          resume: resumeId,
+          timeoutMs: CLAUDE_TIMEOUT_MS,
+        });
+      } catch (err) {
+        const e = err instanceof ClaudeError ? err : (err as Error);
+        log.error(
+          { err: e.message, channel: channelLabel, threadId: threadKey },
+          'claude run failed in claw-maintenance',
+        );
+        logEvent(this.db, {
+          type: 'claude.error',
+          channel: channelLabel,
+          threadId: threadKey,
+          summary: e.message.slice(0, 300),
+          meta: { target: 'claw' },
+        });
+        emitEvent({
+          ts: new Date().toISOString(),
+          type: 'claude.error',
+          channel: channelLabel,
+          threadId: threadKey,
+          summary: e.message.slice(0, 300),
+        });
+        try {
+          await safeSend(
+            target.channel,
+            `claude run failed: ${truncate(e.message, 1500)}`,
+          );
+        } catch (sendErr) {
+          log.error(
+            { err: (sendErr as Error).message },
+            'failed to post claude error message (claw-maintenance)',
+          );
+        }
+        return;
+      }
+
+      // Detect & strip restart marker before posting.
+      const { text: visibleText, restart } = extractRestartMarker(result.text);
+
+      const chunks = splitMessage(visibleText, SAFE_CHUNK_SIZE);
+      for (const chunk of chunks) {
+        try {
+          await safeSend(target.channel, chunk);
+        } catch (err) {
+          log.error(
+            { err: (err as Error).message, channel: channelLabel, threadId: threadKey },
+            'failed to send response chunk (claw-maintenance)',
+          );
+          break;
+        }
+      }
+
+      try {
+        upsertSession(this.db, {
+          threadId: threadKey,
+          claudeSessionId: result.sessionId,
+          repo: 'greatSumini/claw',
+          cwd,
+        });
+      } catch (err) {
+        log.error(
+          { err: (err as Error).message, threadId: threadKey },
+          'failed to upsert session (claw-maintenance)',
+        );
+      }
+
+      logEvent(this.db, {
+        type: 'claude.result',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `${result.durationMs}ms ${visibleText.length}chars${restart ? ' [restart]' : ''}`,
+        meta: {
+          duration_seconds: result.durationMs / 1000,
+          target: 'claw',
+          restart,
+        },
+      });
+      emitEvent({
+        ts: new Date().toISOString(),
+        type: 'claude.result',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `${result.durationMs}ms ${visibleText.length}chars${restart ? ' [restart]' : ''}`,
+      });
+
+      logEvent(this.db, {
+        type: 'discord.message.out',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: visibleText.slice(0, 200),
+        meta: { chunks: chunks.length, target: 'claw', restart },
+      });
+      emitEvent({
+        ts: new Date().toISOString(),
+        type: 'discord.message.out',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: visibleText.slice(0, 200),
+      });
+
+      // Trigger restart only after Discord post + session persist.
+      if (restart) {
+        triggerClawRestart(channelLabel, threadKey);
+      }
+    } finally {
+      stopTyping();
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Mutex
   // -------------------------------------------------------------------------
 
@@ -766,6 +963,44 @@ function stripLeadingMention(text: string, botUserId: string): string {
   // Strip one or more leading mentions of the bot (with or without `!`).
   const re = new RegExp(`^(?:<@!?${botUserId}>\\s*)+`);
   return text.replace(re, '').trim();
+}
+
+/**
+ * Detect & strip the claw restart marker. Marker must appear on its own
+ * (anywhere in the body, but typically the last line). The marker line is
+ * removed entirely; surrounding whitespace is normalized.
+ */
+export function extractRestartMarker(text: string): { text: string; restart: boolean } {
+  const idx = text.lastIndexOf(CLAW_RESTART_MARKER);
+  if (idx === -1) return { text, restart: false };
+  const before = text.slice(0, idx).replace(/\s+$/, '');
+  const after = text.slice(idx + CLAW_RESTART_MARKER.length).replace(/^\s+/, '');
+  const cleaned = after.length > 0 ? `${before}\n${after}` : before;
+  return { text: cleaned.trimEnd(), restart: true };
+}
+
+/**
+ * Detached-spawn a `launchctl kickstart -k` against this process's launchd label.
+ * The child sleeps briefly so any in-flight log writes flush before SIGTERM hits.
+ * The grandchild survives our death; launchd respawns claw via KeepAlive.
+ */
+function triggerClawRestart(channelLabel: string, threadKey: string): void {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  const target = `gui/${uid}/com.claw`;
+  log.info(
+    { target, channel: channelLabel, threadId: threadKey },
+    'triggering claw restart via launchctl',
+  );
+  try {
+    const child = spawn(
+      '/bin/sh',
+      ['-c', `sleep 2 && /bin/launchctl kickstart -k ${target}`],
+      { detached: true, stdio: 'ignore' },
+    );
+    child.unref();
+  } catch (err) {
+    log.error({ err: (err as Error).message }, 'failed to spawn claw restart');
+  }
 }
 
 // Re-export types for downstream consumers (e.g. gmail adapter).

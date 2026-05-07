@@ -21,6 +21,7 @@ export interface DiscordMessageContext {
 export type RouteDecision =
   | { kind: 'trivial'; answer: string }
   | { kind: 'repo-work'; repo: RepoEntry; instructions?: string }
+  | { kind: 'claw-maintenance'; instructions?: string }
   | { kind: 'ignore'; reason: string };
 
 export interface MailSummary {
