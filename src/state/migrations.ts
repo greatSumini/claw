@@ -57,6 +57,18 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_events_type_ts ON events(type, ts);
     `,
   },
+  {
+    name: '002_session_analyses',
+    sql: `
+      CREATE TABLE IF NOT EXISTS session_analyses (
+        source_thread_id   TEXT PRIMARY KEY,
+        analysis_session_id TEXT NOT NULL,
+        analyzed_at        TEXT NOT NULL,
+        user_msg_count     INTEGER NOT NULL,
+        status             TEXT NOT NULL DEFAULT 'pending'
+      );
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

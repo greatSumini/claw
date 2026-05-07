@@ -22,8 +22,19 @@ import {
   buildClawMaintenanceSystemAppend,
   CLAW_RESTART_MARKER,
 } from '../orchestrator/prompt.js';
+import {
+  buildConversationTranscript,
+  buildAnalysisPrompt,
+} from '../orchestrator/auto-analysis.js';
 import type { DiscordMessageContext } from '../orchestrator/types.js';
 import { downloadAttachments, attachmentNote } from '../attachments.js';
+import {
+  getSessionAnalysis,
+  upsertSessionAnalysis,
+  markSessionAnalysisDone,
+  findEligibleSessionsForAnalysis,
+  type EligibleSession,
+} from '../state/session-analyses.js';
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -204,6 +215,7 @@ export class DiscordAdapter implements DiscordPoster {
   private pendingRestart: { channelLabel: string; threadKey: string } | null = null;
   private started = false;
   private stopped = false;
+  private analysisTimer: NodeJS.Timeout | null = null;
 
   constructor(opts: DiscordAdapterOpts) {
     if (!opts || !opts.config) throw new Error('DiscordAdapter: config required');
@@ -282,11 +294,17 @@ export class DiscordAdapter implements DiscordPoster {
       this.started = false;
       throw err;
     }
+
+    this.startAnalysisPoller();
   }
 
   async stop(): Promise<void> {
     if (!this.started || this.stopped) return;
     this.stopped = true;
+    if (this.analysisTimer) {
+      clearInterval(this.analysisTimer);
+      this.analysisTimer = null;
+    }
     try {
       this.client.removeAllListeners();
       await this.client.destroy();
@@ -339,6 +357,16 @@ export class DiscordAdapter implements DiscordPoster {
       threadId: ctx.threadId ?? undefined,
       summary: ctx.text.slice(0, 200),
     });
+
+    // Pending analysis reply: route to claw-maintenance to continue the analysis session.
+    if (ctx.threadId) {
+      const analysis = getSessionAnalysis(this.db, ctx.threadId);
+      if (analysis?.status === 'pending') {
+        markSessionAnalysisDone(this.db, ctx.threadId);
+        await this.handleClawMaintenance(msg, ctx);
+        return;
+      }
+    }
 
     let decision;
     try {
@@ -914,6 +942,111 @@ export class DiscordAdapter implements DiscordPoster {
         this.doRestart(this.pendingRestart.channelLabel, this.pendingRestart.threadKey);
       }
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Auto-analysis poller
+  // -------------------------------------------------------------------------
+
+  private startAnalysisPoller(): void {
+    const INTERVAL_MS = 10 * 60 * 1_000; // 10 minutes
+    this.analysisTimer = setInterval(() => {
+      void this.runAnalysisCycle().catch((err) => {
+        log.error({ err: (err as Error).message }, 'analysis poller crashed');
+      });
+    }, INTERVAL_MS);
+    if (this.analysisTimer && typeof this.analysisTimer.unref === 'function') {
+      this.analysisTimer.unref();
+    }
+  }
+
+  private async runAnalysisCycle(): Promise<void> {
+    if (this.pendingRestart !== null) return;
+
+    let eligible: EligibleSession[];
+    try {
+      eligible = findEligibleSessionsForAnalysis(this.db);
+    } catch (err) {
+      log.error({ err: (err as Error).message }, 'analysis: DB query failed');
+      return;
+    }
+
+    for (const session of eligible) {
+      try {
+        await this.analyzeSession(session);
+      } catch (err) {
+        log.error(
+          { err: (err as Error).message, threadId: session.threadId },
+          'analysis: session analysis failed',
+        );
+      }
+    }
+  }
+
+  private async analyzeSession(session: EligibleSession): Promise<void> {
+    const { threadId, userMsgCount } = session;
+    log.info({ threadId, userMsgCount }, 'analysis: starting');
+
+    const transcript = buildConversationTranscript(this.db, threadId);
+    const prompt = buildAnalysisPrompt(threadId, transcript);
+    const systemAppend = buildClawMaintenanceSystemAppend({ isContinuation: false });
+
+    let result;
+    try {
+      result = await runClaude({
+        cwd: this.config.clawRepoPath,
+        prompt,
+        systemAppend,
+        timeoutMs: CLAUDE_TIMEOUT_MS,
+      });
+    } catch (err) {
+      log.error({ err: (err as Error).message, threadId }, 'analysis: claude run failed');
+      return;
+    }
+
+    // Fetch the original thread and post the analysis.
+    let thread;
+    try {
+      thread = await this.client.channels.fetch(threadId);
+    } catch {
+      log.warn({ threadId }, 'analysis: original thread not found');
+      return;
+    }
+    if (!thread || !thread.isTextBased() || !('send' in thread)) {
+      log.warn({ threadId }, 'analysis: thread not text-sendable');
+      return;
+    }
+    const sendable = thread as unknown as TextSendable;
+
+    const { text: visibleText } = extractRestartMarker(result.text);
+    const header = '**[자동 분석 리포트]**\n\n';
+    const chunks = splitMessage(header + visibleText, SAFE_CHUNK_SIZE);
+    for (const chunk of chunks) {
+      try {
+        await safeSend(sendable, chunk);
+      } catch (err) {
+        log.error({ err: (err as Error).message, threadId }, 'analysis: send failed');
+        break;
+      }
+    }
+
+    // Bind analysis session to this thread so follow-up routes to claw-maintenance.
+    upsertSession(this.db, {
+      threadId,
+      claudeSessionId: result.sessionId,
+      repo: 'greatSumini/claw',
+      cwd: this.config.clawRepoPath,
+    });
+
+    upsertSessionAnalysis(this.db, {
+      sourceThreadId: threadId,
+      analysisSessionId: result.sessionId,
+      analyzedAt: new Date().toISOString(),
+      userMsgCount,
+      status: 'pending',
+    });
+
+    log.info({ threadId, sessionId: result.sessionId }, 'analysis: posted');
   }
 
   // -------------------------------------------------------------------------
