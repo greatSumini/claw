@@ -198,6 +198,10 @@ export class DiscordAdapter implements DiscordPoster {
   private readonly client: Client;
   /** Per-thread (or per-channel for DMs) mutex chain. */
   private readonly threadLocks: Map<string, Promise<void>> = new Map();
+  /** Number of Claude runs currently executing inside runWithMutex. */
+  private inFlightCount = 0;
+  /** Set when a restart has been requested; new messages are rejected until restart fires. */
+  private pendingRestart: { channelLabel: string; threadKey: string } | null = null;
   private started = false;
   private stopped = false;
 
@@ -303,6 +307,14 @@ export class DiscordAdapter implements DiscordPoster {
     const ownerId = this.config.env.DISCORD_OWNER_USER_ID;
     if (msg.author.id !== ownerId) {
       // Quietly drop — Discord ACL is the real gate.
+      return;
+    }
+
+    // Drain in progress — reject new work until restart completes.
+    if (this.pendingRestart !== null) {
+      try {
+        await msg.reply('재시작 준비 중입니다. 잠시 후 다시 시도해 주세요.');
+      } catch { /* ignore */ }
       return;
     }
 
@@ -818,12 +830,54 @@ export class DiscordAdapter implements DiscordPoster {
         summary: visibleText.slice(0, 200),
       });
 
-      // Trigger restart only after Discord post + session persist.
+      // Schedule graceful restart after Discord post + session persist.
       if (restart) {
-        triggerClawRestart(channelLabel, threadKey);
+        this.scheduleGracefulRestart(channelLabel, threadKey);
       }
     } finally {
       stopTyping();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Mutex
+  // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // Graceful restart
+  // -------------------------------------------------------------------------
+
+  /**
+   * Request a restart: reject new messages immediately, then fire launchctl
+   * once all in-flight Claude runs complete. If nothing is in flight, fires now.
+   */
+  private scheduleGracefulRestart(channelLabel: string, threadKey: string): void {
+    this.pendingRestart = { channelLabel, threadKey };
+    log.info(
+      { channel: channelLabel, threadId: threadKey, inFlight: this.inFlightCount },
+      'claw restart scheduled — draining in-flight work',
+    );
+    if (this.inFlightCount === 0) {
+      this.doRestart(channelLabel, threadKey);
+    }
+  }
+
+  /** Spawn a detached launchctl kickstart. Called only after all work is drained. */
+  private doRestart(channelLabel: string, threadKey: string): void {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+    const target = `gui/${uid}/com.claw`;
+    log.info(
+      { target, channel: channelLabel, threadId: threadKey },
+      'triggering claw restart via launchctl (drain complete)',
+    );
+    try {
+      const child = spawn('/bin/launchctl', ['kickstart', '-k', target], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+    } catch (err) {
+      log.error({ err: (err as Error).message }, 'failed to spawn claw restart');
     }
   }
 
@@ -838,6 +892,7 @@ export class DiscordAdapter implements DiscordPoster {
       release = resolve;
     });
     this.threadLocks.set(key, myPromise);
+    this.inFlightCount++;
 
     try {
       await prev;
@@ -849,9 +904,14 @@ export class DiscordAdapter implements DiscordPoster {
       await work();
     } finally {
       release();
+      this.inFlightCount--;
       // Only delete if we're still the head of the chain.
       if (this.threadLocks.get(key) === myPromise) {
         this.threadLocks.delete(key);
+      }
+      // If all work is drained and a restart was requested, fire it now.
+      if (this.pendingRestart !== null && this.inFlightCount === 0) {
+        this.doRestart(this.pendingRestart.channelLabel, this.pendingRestart.threadKey);
       }
     }
   }
@@ -982,29 +1042,6 @@ export function extractRestartMarker(text: string): { text: string; restart: boo
   return { text: cleaned.trimEnd(), restart: true };
 }
 
-/**
- * Detached-spawn a `launchctl kickstart -k` against this process's launchd label.
- * The child sleeps briefly so any in-flight log writes flush before SIGTERM hits.
- * The grandchild survives our death; launchd respawns claw via KeepAlive.
- */
-function triggerClawRestart(channelLabel: string, threadKey: string): void {
-  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
-  const target = `gui/${uid}/com.claw`;
-  log.info(
-    { target, channel: channelLabel, threadId: threadKey },
-    'triggering claw restart via launchctl',
-  );
-  try {
-    const child = spawn(
-      '/bin/sh',
-      ['-c', `sleep 2 && /bin/launchctl kickstart -k ${target}`],
-      { detached: true, stdio: 'ignore' },
-    );
-    child.unref();
-  } catch (err) {
-    log.error({ err: (err as Error).message }, 'failed to spawn claw restart');
-  }
-}
 
 // Re-export types for downstream consumers (e.g. gmail adapter).
 export type { TextBasedChannel };
