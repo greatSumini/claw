@@ -1,10 +1,34 @@
-import { createWriteStream, mkdirSync } from 'node:fs';
+import { createWriteStream, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 
 import { log } from './log.js';
+
+const ATTACHMENT_BASE = join(tmpdir(), 'claw-attachments');
+const TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+function pruneOldDirs(): void {
+  try {
+    const entries = readdirSync(ATTACHMENT_BASE);
+    const cutoff = Date.now() - TTL_MS;
+    for (const entry of entries) {
+      const full = join(ATTACHMENT_BASE, entry);
+      try {
+        const mtime = statSync(full).mtimeMs;
+        if (mtime < cutoff) {
+          rmSync(full, { recursive: true, force: true });
+          log.info({ dir: full }, 'pruned old attachment dir');
+        }
+      } catch {
+        // ignore per-entry errors
+      }
+    }
+  } catch {
+    // base dir may not exist yet — that's fine
+  }
+}
 
 /**
  * Downloads Discord attachment URLs to a timestamped temp directory.
@@ -16,8 +40,10 @@ export async function downloadAttachments(
 ): Promise<string[]> {
   if (attachments.length === 0) return [];
 
+  pruneOldDirs();
+
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const destDir = join(tmpdir(), 'claw-attachments', stamp);
+  const destDir = join(ATTACHMENT_BASE, stamp);
   mkdirSync(destDir, { recursive: true });
 
   const saved: string[] = [];
