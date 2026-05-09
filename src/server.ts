@@ -34,8 +34,8 @@ async function main(): Promise<void> {
   const discord = new DiscordAdapter({ config, db });
   await discord.start();
 
-  // Repo sync scheduler (07:00 and 13:00 KST daily git pull)
-  const repoSync = new RepoSyncScheduler(config, (msg) =>
+  // Repo sync: polls every 10 min, only runs when idle 30+ min
+  const repoSync = new RepoSyncScheduler(config, db, (msg) =>
     discord.postToChannel(config.clawChannelId, msg),
   );
   repoSync.start();

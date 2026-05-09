@@ -1,32 +1,20 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import type Database from 'better-sqlite3';
 import type { AppConfig } from '../config.js';
 import { log } from '../log.js';
 
 const execFileAsync = promisify(execFile);
 
+const POLL_INTERVAL_MS = 10 * 60 * 1_000; // poll every 10 minutes
+const IDLE_THRESHOLD_MS = 30 * 60 * 1_000; // only sync when idle 30+ minutes
+
 const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
-const SCHEDULE_HOURS_KST = [7, 13];
 
-function nextScheduledTime(): Date {
-  const nowKST = new Date(Date.now() + KST_OFFSET_MS);
-  const curHour = nowKST.getUTCHours();
-  const curMin = nowKST.getUTCMinutes();
-  const curSec = nowKST.getUTCSeconds();
-
-  for (const hour of SCHEDULE_HOURS_KST) {
-    if (curHour < hour || (curHour === hour && curMin === 0 && curSec === 0)) {
-      const target = new Date(nowKST);
-      target.setUTCHours(hour, 0, 0, 0);
-      return new Date(target.getTime() - KST_OFFSET_MS);
-    }
-  }
-
-  // All times passed today — schedule for first time tomorrow
-  const tomorrow = new Date(nowKST);
-  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-  tomorrow.setUTCHours(SCHEDULE_HOURS_KST[0], 0, 0, 0);
-  return new Date(tomorrow.getTime() - KST_OFFSET_MS);
+function isIdle(db: Database.Database): boolean {
+  const row = db.prepare<[], { ts: string }>('SELECT ts FROM events ORDER BY ts DESC LIMIT 1').get();
+  if (!row) return true;
+  return Date.now() - new Date(row.ts).getTime() >= IDLE_THRESHOLD_MS;
 }
 
 interface SyncTarget {
@@ -75,37 +63,35 @@ async function gitSyncRepo(target: SyncTarget): Promise<string> {
 
 export class RepoSyncScheduler {
   private readonly config: AppConfig;
+  private readonly db: Database.Database;
   private readonly notify: ((msg: string) => Promise<void>) | null;
   private timer: NodeJS.Timeout | null = null;
-  private stopped = false;
 
-  constructor(config: AppConfig, notify?: (msg: string) => Promise<void>) {
+  constructor(config: AppConfig, db: Database.Database, notify?: (msg: string) => Promise<void>) {
     this.config = config;
+    this.db = db;
     this.notify = notify ?? null;
   }
 
   start(): void {
-    this.scheduleNext();
+    this.timer = setInterval(() => {
+      if (!isIdle(this.db)) {
+        log.debug('repo-sync: skipped (activity within last 30 min)');
+        return;
+      }
+      void this.run();
+    }, POLL_INTERVAL_MS);
+    if (this.timer && typeof this.timer.unref === 'function') {
+      this.timer.unref();
+    }
+    log.info({ pollIntervalMs: POLL_INTERVAL_MS, idleThresholdMs: IDLE_THRESHOLD_MS }, 'repo-sync: started');
   }
 
   stop(): void {
-    this.stopped = true;
     if (this.timer) {
-      clearTimeout(this.timer);
+      clearInterval(this.timer);
       this.timer = null;
     }
-  }
-
-  private scheduleNext(): void {
-    if (this.stopped) return;
-    const next = nextScheduledTime();
-    const delay = Math.max(0, next.getTime() - Date.now());
-    log.info({ nextSync: next.toISOString(), delayMs: delay }, 'repo-sync: next scheduled');
-    this.timer = setTimeout(() => {
-      void this.run().finally(() => {
-        if (!this.stopped) this.scheduleNext();
-      });
-    }, delay);
   }
 
   private async run(): Promise<void> {
