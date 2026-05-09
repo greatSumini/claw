@@ -397,7 +397,7 @@ export class DiscordAdapter implements MessengerAdapter {
       type: 'discord.message.in',
       channel: ctx.channelName ?? ctx.channelId,
       threadId: ctx.threadId ?? undefined,
-      summary: ctx.text.slice(0, 200),
+      summary: ctx.text.slice(0, 500),
       meta: {
         authorId: ctx.authorId,
         isMention: ctx.isMention,
@@ -409,7 +409,7 @@ export class DiscordAdapter implements MessengerAdapter {
       type: 'discord.message.in',
       channel: ctx.channelName ?? ctx.channelId,
       threadId: ctx.threadId ?? undefined,
-      summary: ctx.text.slice(0, 200),
+      summary: ctx.text.slice(0, 500),
     });
 
     // Pending analysis reply: route to claw-maintenance to continue the analysis session.
@@ -450,7 +450,7 @@ export class DiscordAdapter implements MessengerAdapter {
           type: 'discord.message.out',
           channel: ctx.channelName ?? ctx.channelId,
           threadId: ctx.threadId ?? undefined,
-          summary: decision.answer.slice(0, 200),
+          summary: decision.answer.slice(0, 500),
           meta: { mode: 'trivial' },
         });
         emitEvent({
@@ -458,7 +458,7 @@ export class DiscordAdapter implements MessengerAdapter {
           type: 'discord.message.out',
           channel: ctx.channelName ?? ctx.channelId,
           threadId: ctx.threadId ?? undefined,
-          summary: decision.answer.slice(0, 200),
+          summary: decision.answer.slice(0, 500),
         });
         return;
       }
@@ -725,7 +725,7 @@ export class DiscordAdapter implements MessengerAdapter {
         type: 'discord.message.out',
         channel: channelLabel,
         threadId: threadKey,
-        summary: result.text.slice(0, 200),
+        summary: result.text.slice(0, 500),
         meta: { chunks: chunks.length },
       });
       emitEvent({
@@ -733,7 +733,7 @@ export class DiscordAdapter implements MessengerAdapter {
         type: 'discord.message.out',
         channel: channelLabel,
         threadId: threadKey,
-        summary: result.text.slice(0, 200),
+        summary: result.text.slice(0, 500),
       });
     } finally {
       stopTyping();
@@ -929,7 +929,7 @@ export class DiscordAdapter implements MessengerAdapter {
         type: 'discord.message.out',
         channel: channelLabel,
         threadId: threadKey,
-        summary: visibleText.slice(0, 200),
+        summary: visibleText.slice(0, 500),
         meta: { chunks: chunks.length, target: 'claw', restart },
       });
       emitEvent({
@@ -937,7 +937,7 @@ export class DiscordAdapter implements MessengerAdapter {
         type: 'discord.message.out',
         channel: channelLabel,
         threadId: threadKey,
-        summary: visibleText.slice(0, 200),
+        summary: visibleText.slice(0, 500),
       });
 
       // Schedule graceful restart after Discord post + session persist.
