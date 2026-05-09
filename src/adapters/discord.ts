@@ -27,6 +27,7 @@ import { routeMessage } from '../orchestrator/router.js';
 import {
   buildRepoWorkSystemAppend,
   buildClawMaintenanceSystemAppend,
+  buildAnalysisSystemAppend,
   CLAW_RESTART_MARKER,
 } from '../orchestrator/prompt.js';
 import {
@@ -38,9 +39,7 @@ import type { MessengerAdapter } from '../messenger/types.js';
 import { downloadAttachments, attachmentNote } from '../attachments.js';
 import { setSenderPolicy } from '../state/mail.js';
 import {
-  getSessionAnalysis,
   upsertSessionAnalysis,
-  markSessionAnalysisDone,
   findEligibleSessionsForAnalysis,
   type EligibleSession,
 } from '../state/session-analyses.js';
@@ -411,16 +410,6 @@ export class DiscordAdapter implements MessengerAdapter {
       threadId: ctx.threadId ?? undefined,
       summary: ctx.text.slice(0, 500),
     });
-
-    // Pending analysis reply: route to claw-maintenance to continue the analysis session.
-    if (ctx.threadId) {
-      const analysis = getSessionAnalysis(this.db, ctx.threadId);
-      if (analysis?.status === 'pending') {
-        markSessionAnalysisDone(this.db, ctx.threadId);
-        await this.handleClawMaintenance(msg, ctx);
-        return;
-      }
-    }
 
     let decision;
     try {
@@ -1072,7 +1061,7 @@ export class DiscordAdapter implements MessengerAdapter {
 
     const transcript = buildConversationTranscript(this.db, threadId);
     const prompt = buildAnalysisPrompt(threadId, transcript, repoLabel);
-    const systemAppend = buildClawMaintenanceSystemAppend({ isContinuation: false });
+    const systemAppend = buildAnalysisSystemAppend();
 
     let result;
     try {
@@ -1113,20 +1102,12 @@ export class DiscordAdapter implements MessengerAdapter {
       }
     }
 
-    // Bind analysis session to this thread so follow-up routes to claw-maintenance.
-    upsertSession(this.db, {
-      threadId,
-      claudeSessionId: result.sessionId,
-      repo: 'greatSumini/claw',
-      cwd: this.config.clawRepoPath,
-    });
-
     upsertSessionAnalysis(this.db, {
       sourceThreadId: threadId,
       analysisSessionId: result.sessionId,
       analyzedAt: new Date().toISOString(),
       userMsgCount,
-      status: 'pending',
+      status: 'done',
     });
 
     log.info({ threadId, sessionId: result.sessionId }, 'analysis: posted');

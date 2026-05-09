@@ -5,6 +5,8 @@ import type { AppConfig, RepoEntry } from '../config.js';
 import { runClaude, ClaudeError } from '../claude.js';
 import { log } from '../log.js';
 import { logEvent } from '../state/events.js';
+import { getMailThread } from '../state/mail.js';
+import { getSession } from '../state/sessions.js';
 import type { MessageContext, RouteDecision } from './types.js';
 
 const CLASSIFIER_TIMEOUT_MS = 30_000;
@@ -177,6 +179,25 @@ export async function routeMessage(args: {
   // 2. Repo-locked channel → no classification needed.
   const repoLocked = findRepoByChannelId(config, ctx.channelId);
   if (repoLocked) {
+    // Guard: mail alert threads with no existing Claude session must not be auto-routed.
+    // The user may just be acknowledging the alert, not requesting work to start.
+    // Once the user has explicitly started a session (session row exists), allow normal routing.
+    if (ctx.threadId) {
+      const mailThread = getMailThread(db, ctx.threadId);
+      if (mailThread) {
+        const existingSession = getSession(db, ctx.threadId);
+        if (!existingSession) {
+          logEvent(db, {
+            type: 'router.classify',
+            channel: ctx.channelId,
+            threadId: ctx.threadId,
+            summary: `mail alert thread, no session → ignored (${repoLocked.fullName})`,
+            meta: { mode: 'mail-thread-guard', repo: repoLocked.fullName },
+          });
+          return { kind: 'ignore', reason: 'mail alert thread — start work from the claw channel or use @mention' };
+        }
+      }
+    }
     logEvent(db, {
       type: 'router.classify',
       channel: ctx.channelId,
