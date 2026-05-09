@@ -1083,6 +1083,7 @@ export class DiscordAdapter implements MessengerAdapter {
     }
 
     for (const session of eligible) {
+      if (this.pendingRestart !== null) break;
       try {
         await this.analyzeSession(session);
       } catch (err) {
