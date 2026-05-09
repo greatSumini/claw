@@ -28,6 +28,9 @@ export interface MailAlertPoster {
     channelId: string;
     threadName: string;
     initialMessage: string;
+    /** When provided, an "이 발신자 무시" button is attached to the first message. */
+    senderEmail?: string;
+    senderAccount?: string;
   }): Promise<{ threadId: string; firstMessageId: string }>;
 }
 

@@ -577,6 +577,8 @@ export class GmailAdapter {
         channelId: this.config.mailAlertChannelId,
         threadName,
         initialMessage: body,
+        senderEmail: mail.fromEmail,
+        senderAccount: mail.account,
       });
     } catch (err) {
       log.error(

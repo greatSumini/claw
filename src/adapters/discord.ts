@@ -1,11 +1,15 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import {
+  ActionRowBuilder,
   AttachmentBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   Client,
   Events,
   GatewayIntentBits,
   Partials,
+  type ButtonInteraction,
   type Channel,
   type Message,
   type TextBasedChannel,
@@ -31,6 +35,7 @@ import {
 import type { MessageContext } from '../messenger/types.js';
 import type { MessengerAdapter } from '../messenger/types.js';
 import { downloadAttachments, attachmentNote } from '../attachments.js';
+import { setSenderPolicy } from '../state/mail.js';
 import {
   getSessionAnalysis,
   upsertSessionAnalysis,
@@ -41,6 +46,29 @@ import {
 
 // DiscordPoster kept as a re-export alias for backward compatibility.
 export type { MessengerAdapter as DiscordPoster };
+
+// ---------------------------------------------------------------------------
+// Button customId helpers (pure functions — exported for testing)
+// ---------------------------------------------------------------------------
+
+const IGNORE_SENDER_PREFIX = 'ignore-sender';
+
+export function buildIgnoreSenderButtonId(email: string, account: string): string {
+  return `${IGNORE_SENDER_PREFIX}:${email}:${account}`;
+}
+
+export function parseIgnoreSenderButtonId(
+  customId: string,
+): { email: string; account: string } | null {
+  if (!customId.startsWith(`${IGNORE_SENDER_PREFIX}:`)) return null;
+  const rest = customId.slice(IGNORE_SENDER_PREFIX.length + 1);
+  const colonIdx = rest.indexOf(':');
+  if (colonIdx === -1) return null;
+  const email = rest.slice(0, colonIdx);
+  const account = rest.slice(colonIdx + 1);
+  if (!email || !account) return null;
+  return { email, account };
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -240,6 +268,16 @@ export class DiscordAdapter implements MessengerAdapter {
       });
     });
 
+    this.client.on(Events.InteractionCreate, (interaction) => {
+      if (!interaction.isButton()) return;
+      void this.onButtonInteraction(interaction as ButtonInteraction).catch((err) => {
+        log.error(
+          { err: (err as Error).message },
+          'discord button interaction handler crashed',
+        );
+      });
+    });
+
     this.client.on(Events.ShardError, (err, shardId) => {
       log.error({ err: err.message, shardId }, 'discord shard error');
     });
@@ -301,6 +339,31 @@ export class DiscordAdapter implements MessengerAdapter {
     } finally {
       log.info('Discord stopped');
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Button interaction handling
+  // -------------------------------------------------------------------------
+
+  private async onButtonInteraction(interaction: ButtonInteraction): Promise<void> {
+    const parsed = parseIgnoreSenderButtonId(interaction.customId);
+    if (!parsed) return;
+
+    const { email, account } = parsed;
+
+    setSenderPolicy(this.db, { email, account, policy: 'ignore', reason: 'Discord 버튼으로 무시 설정' });
+
+    log.info({ email, account }, 'sender ignored via button');
+    logEvent(this.db, {
+      type: 'importance.classify',
+      summary: `button ignore: ${email}`,
+      meta: { mode: 'button', verdict: 'ignore', from: email, account },
+    });
+
+    await interaction.reply({
+      content: `앞으로 **${email}** 발신자의 메일은 무시합니다.`,
+      flags: 64, // ephemeral
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -1118,6 +1181,8 @@ export class DiscordAdapter implements MessengerAdapter {
     channelId: string;
     threadName: string;
     initialMessage: string;
+    senderEmail?: string;
+    senderAccount?: string;
   }): Promise<{ threadId: string; firstMessageId: string }> {
     if (!args || typeof args.channelId !== 'string' || args.channelId.length === 0) {
       throw new Error('postMailAlert: channelId required');
@@ -1139,7 +1204,21 @@ export class DiscordAdapter implements MessengerAdapter {
     const sendable = channel as unknown as TextSendable;
 
     const chunks = splitMessage(args.initialMessage, SAFE_CHUNK_SIZE);
-    const firstMsg = await sendable.send(chunks[0] ?? '');
+
+    // Attach "이 발신자 무시" button if sender info provided.
+    let components: ActionRowBuilder<ButtonBuilder>[] = [];
+    if (args.senderEmail && args.senderAccount) {
+      const btn = new ButtonBuilder()
+        .setCustomId(buildIgnoreSenderButtonId(args.senderEmail, args.senderAccount))
+        .setLabel('이 발신자 무시')
+        .setStyle(ButtonStyle.Secondary);
+      components = [new ActionRowBuilder<ButtonBuilder>().addComponents(btn)];
+    }
+
+    const firstMsg = await sendable.send({
+      content: chunks[0] ?? '',
+      components,
+    });
 
     const truncatedName = truncate(args.threadName, THREAD_NAME_MAX);
     const thread = await firstMsg.startThread({
@@ -1198,7 +1277,11 @@ export class DiscordAdapter implements MessengerAdapter {
  */
 interface TextSendable {
   send(content: string): Promise<Message>;
-  send(options: { content?: string; files?: AttachmentBuilder[] }): Promise<Message>;
+  send(options: {
+    content?: string;
+    files?: AttachmentBuilder[];
+    components?: ActionRowBuilder<ButtonBuilder>[];
+  }): Promise<Message>;
   sendTyping(): Promise<void>;
   id: string;
 }

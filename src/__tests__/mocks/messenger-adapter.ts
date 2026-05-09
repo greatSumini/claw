@@ -1,6 +1,6 @@
 import type { MessengerAdapter } from '../../messenger/types.js';
 
-type PostMailAlertArgs = Parameters<MessengerAdapter['postMailAlert']>[0];
+export type PostMailAlertArgs = Parameters<MessengerAdapter['postMailAlert']>[0];
 type SendFileArgs = Parameters<MessengerAdapter['sendFile']>[0];
 
 /**
