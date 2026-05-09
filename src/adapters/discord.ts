@@ -989,11 +989,12 @@ export class DiscordAdapter implements MessengerAdapter {
   }
 
   private async analyzeSession(session: EligibleSession): Promise<void> {
-    const { threadId, userMsgCount } = session;
-    log.info({ threadId, userMsgCount }, 'analysis: starting');
+    const { threadId, userMsgCount, repo } = session;
+    const repoLabel = repo ?? 'unknown';
+    log.info({ threadId, userMsgCount, repo: repoLabel }, 'analysis: starting');
 
     const transcript = buildConversationTranscript(this.db, threadId);
-    const prompt = buildAnalysisPrompt(threadId, transcript);
+    const prompt = buildAnalysisPrompt(threadId, transcript, repoLabel);
     const systemAppend = buildClawMaintenanceSystemAppend({ isContinuation: false });
 
     let result;

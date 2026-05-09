@@ -73,6 +73,8 @@ export interface EligibleSession {
   userMsgCount: number;
   channel: string | null;
   lastTs: string;
+  /** GitHub fullName of the repo worked on in this session (e.g. "vibemafiaclub/context-hub"). */
+  repo: string | null;
 }
 
 /**
@@ -90,13 +92,14 @@ export function findEligibleSessionsForAnalysis(
 ): EligibleSession[] {
   const stmt = db.prepare<
     [],
-    { thread_id: string; user_msg_count: number; channel: string | null; last_ts: string }
+    { thread_id: string; user_msg_count: number; channel: string | null; last_ts: string; repo: string | null }
   >(`
     SELECT
       e.thread_id,
       COUNT(CASE WHEN e.type = 'discord.message.in' THEN 1 END) AS user_msg_count,
       (SELECT channel FROM events WHERE thread_id = e.thread_id AND type = 'discord.message.out' ORDER BY ts DESC LIMIT 1) AS channel,
-      (SELECT ts      FROM events WHERE thread_id = e.thread_id AND type = 'discord.message.out' ORDER BY ts DESC LIMIT 1) AS last_ts
+      (SELECT ts      FROM events WHERE thread_id = e.thread_id AND type = 'discord.message.out' ORDER BY ts DESC LIMIT 1) AS last_ts,
+      (SELECT repo    FROM sessions WHERE thread_id = e.thread_id) AS repo
     FROM events e
     WHERE e.thread_id IS NOT NULL
       AND e.thread_id NOT IN (SELECT source_thread_id FROM session_analyses)
@@ -116,5 +119,6 @@ export function findEligibleSessionsForAnalysis(
     userMsgCount: row.user_msg_count,
     channel: row.channel,
     lastTs: row.last_ts,
+    repo: row.repo,
   }));
 }
