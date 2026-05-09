@@ -69,6 +69,17 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    name: '003_message_queue',
+    sql: `
+      CREATE TABLE IF NOT EXISTS message_queue (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id  TEXT NOT NULL,
+        message_id  TEXT NOT NULL UNIQUE,
+        queued_at   TEXT NOT NULL
+      );
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

@@ -43,6 +43,11 @@ import {
   findEligibleSessionsForAnalysis,
   type EligibleSession,
 } from '../state/session-analyses.js';
+import {
+  enqueueMessage,
+  getPendingMessages,
+  deleteQueuedMessage,
+} from '../state/message-queue.js';
 
 // DiscordPoster kept as a re-export alias for backward compatibility.
 export type { MessengerAdapter as DiscordPoster };
@@ -324,6 +329,9 @@ export class DiscordAdapter implements MessengerAdapter {
     }
 
     this.startAnalysisPoller();
+    void this.processMessageQueue().catch((err) => {
+      log.error({ err: (err as Error).message }, 'processMessageQueue crashed');
+    });
   }
 
   async stop(): Promise<void> {
@@ -381,10 +389,11 @@ export class DiscordAdapter implements MessengerAdapter {
       return;
     }
 
-    // Drain in progress — reject new work until restart completes.
+    // Drain in progress — queue the message and notify; will be replayed after restart.
     if (this.pendingRestart !== null) {
       try {
-        await msg.reply('재시작 준비 중입니다. 잠시 후 다시 시도해 주세요.');
+        enqueueMessage(this.db, msg.channelId, msg.id);
+        await msg.reply('재시작 준비 중입니다. 재시작 완료 후 자동으로 처리됩니다.');
       } catch { /* ignore */ }
       return;
     }
@@ -1011,6 +1020,37 @@ export class DiscordAdapter implements MessengerAdapter {
       // If all work is drained and a restart was requested, fire it now.
       if (this.pendingRestart !== null && this.inFlightCount === 0) {
         this.doRestart(this.pendingRestart.channelLabel, this.pendingRestart.threadKey);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Post-restart message queue
+  // -------------------------------------------------------------------------
+
+  private async processMessageQueue(): Promise<void> {
+    const pending = getPendingMessages(this.db);
+    if (pending.length === 0) return;
+
+    log.info({ count: pending.length }, 'replaying queued messages after restart');
+
+    for (const queued of pending) {
+      // Delete first to avoid infinite re-queue if processing crashes.
+      deleteQueuedMessage(this.db, queued.id);
+      try {
+        const channel = await this.client.channels.fetch(queued.channelId);
+        if (!channel || !('messages' in channel)) {
+          log.warn({ channelId: queued.channelId }, 'queued message: channel not found');
+          continue;
+        }
+        const fetchedMsg = await (channel as { messages: { fetch: (id: string) => Promise<Message> } }).messages.fetch(queued.messageId);
+        log.info({ channelId: queued.channelId, messageId: queued.messageId }, 'replaying queued message');
+        await this.onMessage(fetchedMsg);
+      } catch (err) {
+        log.error(
+          { err: (err as Error).message, channelId: queued.channelId, messageId: queued.messageId },
+          'queued message: replay failed',
+        );
       }
     }
   }
