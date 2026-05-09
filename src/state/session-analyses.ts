@@ -77,10 +77,13 @@ export interface EligibleSession {
 
 /**
  * Find threads eligible for auto-analysis:
- * - Last event was a claw response (discord.message.out)
- * - That response was 10+ minutes ago
+ * - Last discord.message.out was 10+ minutes ago
+ * - No discord.message.in after the last discord.message.out
  * - User sent 5+ messages in the thread
  * - Not already analyzed
+ *
+ * Note: claude.result and discord.message.out share the same timestamp, so we
+ * cannot rely on "last event overall" — instead we compare per-type last timestamps.
  */
 export function findEligibleSessionsForAnalysis(
   db: Database.Database,
@@ -92,17 +95,20 @@ export function findEligibleSessionsForAnalysis(
     SELECT
       e.thread_id,
       COUNT(CASE WHEN e.type = 'discord.message.in' THEN 1 END) AS user_msg_count,
-      (SELECT channel FROM events WHERE thread_id = e.thread_id ORDER BY ts DESC LIMIT 1) AS channel,
-      (SELECT ts      FROM events WHERE thread_id = e.thread_id ORDER BY ts DESC LIMIT 1) AS last_ts
+      (SELECT channel FROM events WHERE thread_id = e.thread_id AND type = 'discord.message.out' ORDER BY ts DESC LIMIT 1) AS channel,
+      (SELECT ts      FROM events WHERE thread_id = e.thread_id AND type = 'discord.message.out' ORDER BY ts DESC LIMIT 1) AS last_ts
     FROM events e
     WHERE e.thread_id IS NOT NULL
       AND e.thread_id NOT IN (SELECT source_thread_id FROM session_analyses)
     GROUP BY e.thread_id
     HAVING
-      (SELECT type FROM events WHERE thread_id = e.thread_id ORDER BY ts DESC LIMIT 1) = 'discord.message.out'
-      AND datetime(
-            (SELECT ts FROM events WHERE thread_id = e.thread_id ORDER BY ts DESC LIMIT 1)
-          ) < datetime('now', '-10 minutes')
+      last_ts IS NOT NULL
+      AND datetime(last_ts) < datetime('now', '-10 minutes')
+      AND (
+        (SELECT MAX(ts) FROM events WHERE thread_id = e.thread_id AND type = 'discord.message.in')
+        <=
+        last_ts
+      )
       AND user_msg_count >= 5
   `);
   return stmt.all().map((row) => ({

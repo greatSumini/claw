@@ -445,19 +445,23 @@ export class GmailAdapter {
         processed += 1;
         if (r.alerted) alerted += 1;
       } catch (err) {
+        const errMsg = (err as Error).message ?? '';
+        // Gmail returns 404 "Requested entity was not found" when a message was
+        // deleted before we could fetch it. This is expected and unrecoverable —
+        // skip silently rather than polluting the error log.
+        if (errMsg.includes('Requested entity was not found')) {
+          log.debug({ account: account.email, id }, 'gmail: message not found (deleted), skipping');
+          continue;
+        }
         log.error(
-          { account: account.email, id, err: (err as Error).message },
+          { account: account.email, id, err: errMsg },
           'gmail: failed to process message, will retry on next cycle',
         );
-        // Don't advance historyId past failures? We do still advance because
-        // history.list pagination is by historyId; the message will not appear
-        // again. We rely on classifier/posting being retried via other paths.
-        // For safety, log explicit event.
         logEvent(this.db, {
           type: 'mail.error',
           channel: MAIL_ALERT_CHANNEL_NAME,
           summary: `process error: ${id}`,
-          meta: { account: account.email, gmailMsgId: id, error: (err as Error).message },
+          meta: { account: account.email, gmailMsgId: id, error: errMsg },
         });
       }
     }
