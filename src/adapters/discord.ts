@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
+import path from 'node:path';
 import {
+  AttachmentBuilder,
   Client,
   Events,
   GatewayIntentBits,
@@ -1158,6 +1160,31 @@ export class DiscordAdapter implements MessengerAdapter {
 
     return { threadId: thread.id, firstMessageId: firstMsg.id };
   }
+
+  // -------------------------------------------------------------------------
+  // sendFile — attach a local file to a channel or thread
+  // -------------------------------------------------------------------------
+
+  async sendFile(args: {
+    channelId: string;
+    threadId: string | null;
+    filePath: string;
+    caption?: string;
+  }): Promise<void> {
+    const targetId = args.threadId ?? args.channelId;
+    const channel: Channel | null = await this.client.channels.fetch(targetId);
+    if (!channel || !channel.isTextBased() || !('send' in channel)) {
+      throw new Error(`sendFile: channel/thread ${targetId} not found or not text-based`);
+    }
+    const attachment = new AttachmentBuilder(args.filePath, {
+      name: path.basename(args.filePath),
+    });
+    const sendable = channel as unknown as TextSendable;
+    await sendable.send({
+      content: args.caption ?? '',
+      files: [attachment],
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,6 +1197,7 @@ export class DiscordAdapter implements MessengerAdapter {
  */
 interface TextSendable {
   send(content: string): Promise<Message>;
+  send(options: { content?: string; files?: AttachmentBuilder[] }): Promise<Message>;
   sendTyping(): Promise<void>;
   id: string;
 }

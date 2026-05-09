@@ -37,4 +37,14 @@ export interface MessengerAdapter extends MailAlertPoster {
   start(): Promise<void>;
   stop(): Promise<void>;
   postToChannel(channelId: string, content: string): Promise<void>;
+  /**
+   * Send a file attachment to a thread (or channel-level if threadId is null).
+   * `filePath` must be an absolute local path that exists at call time.
+   */
+  sendFile(args: {
+    channelId: string;
+    threadId: string | null;
+    filePath: string;
+    caption?: string;
+  }): Promise<void>;
 }

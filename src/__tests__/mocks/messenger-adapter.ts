@@ -1,6 +1,7 @@
 import type { MessengerAdapter } from '../../messenger/types.js';
 
 type PostMailAlertArgs = Parameters<MessengerAdapter['postMailAlert']>[0];
+type SendFileArgs = Parameters<MessengerAdapter['sendFile']>[0];
 
 /**
  * In-memory MessengerAdapter for unit tests.
@@ -12,9 +13,11 @@ export class MockMessengerAdapter implements MessengerAdapter {
   readonly calls: {
     postMailAlert: PostMailAlertArgs[];
     postToChannel: { channelId: string; content: string }[];
+    sendFile: SendFileArgs[];
   } = {
     postMailAlert: [],
     postToChannel: [],
+    sendFile: [],
   };
 
   private _mailAlertResult = {
@@ -30,6 +33,7 @@ export class MockMessengerAdapter implements MessengerAdapter {
   reset(): void {
     this.calls.postMailAlert.length = 0;
     this.calls.postToChannel.length = 0;
+    this.calls.sendFile.length = 0;
   }
 
   async postMailAlert(args: PostMailAlertArgs) {
@@ -39,6 +43,10 @@ export class MockMessengerAdapter implements MessengerAdapter {
 
   async postToChannel(channelId: string, content: string): Promise<void> {
     this.calls.postToChannel.push({ channelId, content });
+  }
+
+  async sendFile(args: SendFileArgs): Promise<void> {
+    this.calls.sendFile.push({ ...args });
   }
 
   async start(): Promise<void> {}
