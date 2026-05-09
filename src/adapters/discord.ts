@@ -528,9 +528,15 @@ export class DiscordAdapter implements DiscordPoster {
       return;
     }
 
-    // 2. Per-thread mutex.
+    // 2. If this is a thread with no existing session (e.g. reply to a mail alert thread),
+    //    fetch prior thread content so Claude has context.
+    const existingSession = getSession(this.db, threadKey);
+    const threadContext =
+      isThread && !existingSession ? await this.fetchThreadContext(msg) : undefined;
+
+    // 3. Per-thread mutex.
     await this.runWithMutex(threadKey, () =>
-      this.runRepoWorkInThread(ctx, repo, target, threadKey),
+      this.runRepoWorkInThread(ctx, repo, target, threadKey, threadContext),
     );
   }
 
@@ -539,6 +545,7 @@ export class DiscordAdapter implements DiscordPoster {
     repo: RepoEntry,
     target: TargetChannel,
     threadKey: string,
+    threadContext?: string,
   ): Promise<void> {
     const channelLabel = ctx.channelName ?? ctx.channelId;
 
@@ -551,7 +558,8 @@ export class DiscordAdapter implements DiscordPoster {
 
     try {
       const savedPaths = await downloadAttachments(ctx.attachments ?? []);
-      const userMessage = ctx.text + attachmentNote(savedPaths);
+      const baseText = ctx.text + attachmentNote(savedPaths);
+      const userMessage = threadContext ? `${threadContext}\n\n${baseText}` : baseText;
       const systemAppend = buildRepoWorkSystemAppend({
         userMessage,
         repo,
@@ -711,8 +719,12 @@ export class DiscordAdapter implements DiscordPoster {
       return;
     }
 
+    const existingSession = getSession(this.db, threadKey);
+    const threadContext =
+      isThread && !existingSession ? await this.fetchThreadContext(msg) : undefined;
+
     await this.runWithMutex(threadKey, () =>
-      this.runClawMaintenanceInThread(ctx, target, threadKey),
+      this.runClawMaintenanceInThread(ctx, target, threadKey, threadContext),
     );
   }
 
@@ -720,6 +732,7 @@ export class DiscordAdapter implements DiscordPoster {
     ctx: DiscordMessageContext,
     target: TargetChannel,
     threadKey: string,
+    threadContext?: string,
   ): Promise<void> {
     const channelLabel = ctx.channelName ?? ctx.channelId;
     const cwd = this.config.clawRepoPath;
@@ -731,7 +744,8 @@ export class DiscordAdapter implements DiscordPoster {
 
     try {
       const savedPaths = await downloadAttachments(ctx.attachments ?? []);
-      const userMessage = ctx.text + attachmentNote(savedPaths);
+      const baseText = ctx.text + attachmentNote(savedPaths);
+      const userMessage = threadContext ? `${threadContext}\n\n${baseText}` : baseText;
       const systemAppend = buildClawMaintenanceSystemAppend({
         isContinuation: Boolean(resumeId),
       });
@@ -1047,6 +1061,49 @@ export class DiscordAdapter implements DiscordPoster {
     });
 
     log.info({ threadId, sessionId: result.sessionId }, 'analysis: posted');
+  }
+
+  // -------------------------------------------------------------------------
+  // Thread context helper
+  // -------------------------------------------------------------------------
+
+  /**
+   * Fetch prior content from a thread so Claude can understand the original context
+   * (e.g. a mail alert that created the thread). Only called when there is no
+   * existing Claude session for the thread.
+   */
+  private async fetchThreadContext(msg: Message): Promise<string | undefined> {
+    const channel = msg.channel;
+    if (!channel.isThread()) return undefined;
+
+    const lines: string[] = [];
+
+    // The message that started the thread (typically the mail alert body).
+    try {
+      const starter = await channel.fetchStarterMessage({ cache: false });
+      if (starter?.content) {
+        const label = starter.author.bot ? '[알림]' : `[${starter.author.username}]`;
+        lines.push(`${label}: ${starter.content}`);
+      }
+    } catch {
+      // Thread may not have a starter message (e.g. forum threads).
+    }
+
+    // Messages sent inside the thread before the current one.
+    try {
+      const fetched = await channel.messages.fetch({ limit: 20, before: msg.id, cache: false });
+      const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+      for (const m of sorted) {
+        if (!m.content) continue;
+        const label = m.author.bot ? '[claw]' : `[${m.author.username}]`;
+        lines.push(`${label}: ${m.content}`);
+      }
+    } catch (err) {
+      log.warn({ err: (err as Error).message }, 'fetchThreadContext: messages.fetch failed');
+    }
+
+    if (lines.length === 0) return undefined;
+    return `[스레드 이전 내용]\n${lines.join('\n')}\n---`;
   }
 
   // -------------------------------------------------------------------------
