@@ -9,6 +9,60 @@ import type { ImportanceVerdict, MailSummary } from './types.js';
 const CLASSIFIER_TIMEOUT_MS = 60_000;
 const BODY_TRUNCATE = 1500;
 
+/**
+ * Domains/patterns that are always noise — auto-notification senders that
+ * never require a human response. Checked before the LLM classifier to
+ * save tokens and reduce false-positive "important" verdicts.
+ *
+ * Rules (in order of precedence):
+ * 1. Exact email match
+ * 2. Exact domain match
+ * 3. Domain suffix match (e.g. ".google.com" matches any subdomain)
+ * 4. Local-part prefix "no-reply" or "noreply" (catches service-wide patterns)
+ *
+ * Intentionally NOT included: cal.com (meeting confirmations are actionable),
+ * github.com (PR/CI notifications contain useful info), bolta.io (invoicing).
+ */
+const SKIP_DOMAINS: string[] = [
+  'accounts.google.com',
+  'google.com',        // cloudplatform-noreply@google.com etc.
+  'wallet-email.samsung.com',
+  'wishket.com',
+  'modusign.co.kr',
+  'amazonaws.com',
+  'vooster.ai',
+  'gpters.org',
+  'lemonsqueezy-mail.com',
+  'skyboundrural.com',
+];
+
+/**
+ * Returns true if the sender email should be skipped before LLM classification.
+ * This catches well-known automated/notification senders that are never actionable.
+ */
+export function shouldSkipByDomainPattern(email: string): boolean {
+  const lower = email.toLowerCase().trim();
+  const atIdx = lower.indexOf('@');
+  if (atIdx === -1) return false;
+
+  const localPart = lower.slice(0, atIdx);
+  const domain = lower.slice(atIdx + 1);
+
+  // Rule: no-reply / noreply local-part prefix (e.g. no-reply@modusign.co.kr)
+  if (localPart === 'no-reply' || localPart === 'noreply' || localPart.startsWith('no-reply.') || localPart.startsWith('noreply.') || localPart.endsWith('.noreply') || localPart.endsWith('.no-reply')) {
+    // Exceptions: senders where even no-reply emails are actionable
+    const noReplyExceptions = ['github.com', 'cal.com'];
+    if (!noReplyExceptions.includes(domain)) return true;
+  }
+
+  // Rule: known noise domains / subdomains
+  for (const skipDomain of SKIP_DOMAINS) {
+    if (domain === skipDomain || domain.endsWith(`.${skipDomain}`)) return true;
+  }
+
+  return false;
+}
+
 interface ClassifierImportant {
   kind: 'important';
   oneLineSummary: string;
@@ -168,7 +222,27 @@ export async function classifyMail(args: {
 }): Promise<ImportanceVerdict> {
   const { mail, config, db } = args;
 
-  // 1. Sender policy short-circuit.
+  // 1. Domain pattern pre-filter — well-known automated senders, no LLM needed.
+  if (shouldSkipByDomainPattern(mail.fromEmail)) {
+    log.debug(
+      { from: mail.fromEmail, account: mail.account, subject: mail.subject },
+      'mail pre-filtered by domain pattern: ignore',
+    );
+    logEvent(db, {
+      type: 'importance.classify',
+      summary: `pattern ignore: ${mail.subject}`,
+      meta: {
+        mode: 'pattern',
+        verdict: 'ignore',
+        from: mail.fromEmail,
+        account: mail.account,
+        messageId: mail.messageId,
+      },
+    });
+    return { kind: 'ignore', reason: 'sender domain pattern matched' };
+  }
+
+  // 2. Sender policy short-circuit.
   const policy = getSenderPolicy(db, mail.fromEmail, mail.account);
   if (policy?.policy === 'ignore') {
     log.info(
@@ -189,7 +263,7 @@ export async function classifyMail(args: {
     return { kind: 'ignore', reason: 'sender ignore-listed' };
   }
 
-  // 2. Build classifier prompt and call claude.
+  // 3. Build classifier prompt and call claude.
   // Use the mail-alert repo's localPath as cwd so the classifier benefits from CLAUDE.md context.
   const alertRepo = findRepoByChannelId(config, config.mailAlertChannelId);
   const cwd = alertRepo?.localPath ?? config.paths.dataDir;
