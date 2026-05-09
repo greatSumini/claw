@@ -8,6 +8,7 @@ import { getDb, closeDb } from './state/db.js';
 import { mountDashboard } from './dashboard/routes.js';
 import { DiscordAdapter } from './adapters/discord.js';
 import { GmailAdapter } from './adapters/gmail.js';
+import { RepoSyncScheduler } from './scheduler/repo-sync.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -33,6 +34,12 @@ async function main(): Promise<void> {
   const discord = new DiscordAdapter({ config, db });
   await discord.start();
 
+  // Repo sync scheduler (07:00 and 13:00 KST daily git pull)
+  const repoSync = new RepoSyncScheduler(config, (msg) =>
+    discord.postToChannel(config.clawChannelId, msg),
+  );
+  repoSync.start();
+
   // Gmail (optional — only if configured)
   let gmail: GmailAdapter | null = null;
   const gmailReady = config.gmail.length > 0 && config.env.GMAIL_CLIENT_ID && config.env.GMAIL_CLIENT_SECRET;
@@ -55,6 +62,7 @@ async function main(): Promise<void> {
     log.info({ signal }, 'shutdown initiated');
     try {
       server.close();
+      repoSync.stop();
       await discord.stop();
       if (gmail) await gmail.stop();
       closeDb();

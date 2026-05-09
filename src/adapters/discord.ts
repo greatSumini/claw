@@ -1050,6 +1050,18 @@ export class DiscordAdapter implements DiscordPoster {
   }
 
   // -------------------------------------------------------------------------
+  // postToChannel — simple one-shot message to a channel (used by repo-sync)
+  // -------------------------------------------------------------------------
+
+  async postToChannel(channelId: string, content: string): Promise<void> {
+    const channel: Channel | null = await this.client.channels.fetch(channelId);
+    if (!channel || !channel.isTextBased() || !('send' in channel)) {
+      throw new Error(`postToChannel: channel ${channelId} not found or not text-based`);
+    }
+    await safeSend(channel as unknown as TextSendable, content);
+  }
+
+  // -------------------------------------------------------------------------
   // postMailAlert (DiscordPoster)
   // -------------------------------------------------------------------------
 
