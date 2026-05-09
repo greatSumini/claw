@@ -1,4 +1,5 @@
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import path from 'node:path';
 import {
   ActionRowBuilder,
@@ -863,7 +864,20 @@ export class DiscordAdapter implements MessengerAdapter {
       }
 
       // Detect & strip restart marker before posting.
-      const { text: visibleText, restart } = extractRestartMarker(result.text);
+      const { text: visibleText, restart: markerRestart } = extractRestartMarker(result.text);
+
+      // Fallback: if the marker was omitted, check git diff and force restart if src changed.
+      let restart = markerRestart;
+      if (!restart) {
+        const srcModified = await checkSrcModifiedInLastCommit(cwd);
+        if (srcModified) {
+          log.warn(
+            { channel: channelLabel, threadId: threadKey },
+            'restart marker absent but src files modified in last commit — forcing restart',
+          );
+          restart = true;
+        }
+      }
 
       const chunks = splitMessage(visibleText, SAFE_CHUNK_SIZE);
       for (const chunk of chunks) {
@@ -1345,6 +1359,26 @@ export function extractRestartMarker(text: string): { text: string; restart: boo
   return { text: cleaned.trimEnd(), restart: true };
 }
 
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Returns true if the most recent commit in the repo touched src/ or key config files.
+ * Used as a fallback to catch cases where the Claude response omitted the restart marker.
+ */
+async function checkSrcModifiedInLastCommit(cwd: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync('git', ['diff', '--name-only', 'HEAD~1', 'HEAD'], {
+      cwd,
+    });
+    const files = stdout.split('\n').filter(Boolean);
+    return files.some(
+      (f) => f.startsWith('src/') || f === 'package.json' || f === 'tsconfig.json',
+    );
+  } catch {
+    return false;
+  }
+}
 
 // Re-export types for downstream consumers (e.g. gmail adapter).
 export type { TextBasedChannel };

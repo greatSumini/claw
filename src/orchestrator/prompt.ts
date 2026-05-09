@@ -71,11 +71,14 @@ export function buildClawMaintenanceSystemAppend(
     '- 작업 끝나면 의미 단위로 git commit & push까지 완수. 첫 push 시 `gh auth setup-git` 먼저 (idempotent, GH_TOKEN 자동 인식). 실패 시 강행 금지(-f X), 보고만.',
   );
   lines.push(
-    '- 소스/설정 변경(`src/**`, `package.json`, `tsconfig.json` 등 빌드 산출물에 영향)이면 `pnpm build`까지 완료해라. 그리고 **반영을 위해 claw 프로세스 재실행이 필요하면, 응답의 마지막 줄에 정확히 다음 마커만 출력**: `' +
+    '- 소스/설정 변경(`src/**`, `package.json`, `tsconfig.json` 등 빌드 산출물에 영향)이면 `pnpm build`까지 완료해라. 그리고 **소스/설정 변경이면 예외 없이 응답의 마지막 줄에 다음 마커를 출력**: `' +
       CLAW_RESTART_MARKER +
       '`. 마커는 claw가 검출해서 본문에서 제거 후 `launchctl kickstart -k gui/<uid>/com.claw`로 자동 재시작한다. (README/문서/테스트만 수정한 경우 마커 출력 불필요) **중요: 마커만 단독으로 출력하지 말 것. 반드시 마커 앞에 사람이 읽을 수 있는 응답 텍스트를 포함해야 한다 — 마커는 제거되므로 텍스트가 없으면 Discord에 빈 메시지가 전송된다.**',
   );
   lines.push('- 최종 답변은 핵심만 간결히 (Discord에 그대로 전달됨, 2000자 이상 시 자동 분할됨)');
+  lines.push(
+    '- 완료 메시지 끝에 재시작 여부를 반드시 명시: "재시작: 트리거됨" 또는 "재시작: 불필요 (문서/테스트만 변경)"',
+  );
   if (args.isContinuation) {
     lines.push('- (이전 대화 이어가기 모드 — 같은 thread 안에서의 후속 메시지)');
   }
