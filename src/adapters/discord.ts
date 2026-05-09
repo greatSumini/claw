@@ -16,7 +16,7 @@ import { runClaude, ClaudeError } from '../claude.js';
 import { getSession, upsertSession } from '../state/sessions.js';
 import { logEvent } from '../state/events.js';
 import { emitEvent } from '../dashboard/event-bus.js';
-import { routeDiscord } from '../orchestrator/router.js';
+import { routeMessage } from '../orchestrator/router.js';
 import {
   buildRepoWorkSystemAppend,
   buildClawMaintenanceSystemAppend,
@@ -26,7 +26,8 @@ import {
   buildConversationTranscript,
   buildAnalysisPrompt,
 } from '../orchestrator/auto-analysis.js';
-import type { DiscordMessageContext } from '../orchestrator/types.js';
+import type { MessageContext } from '../messenger/types.js';
+import type { MessengerAdapter } from '../messenger/types.js';
 import { downloadAttachments, attachmentNote } from '../attachments.js';
 import {
   getSessionAnalysis,
@@ -36,22 +37,8 @@ import {
   type EligibleSession,
 } from '../state/session-analyses.js';
 
-// ---------------------------------------------------------------------------
-// Public surface
-// ---------------------------------------------------------------------------
-
-export interface DiscordPoster {
-  /**
-   * Post a mail alert to a channel. If posted to a repo channel that
-   * auto-creates threads, returns that thread ID. Returns the first
-   * message ID for reference.
-   */
-  postMailAlert(args: {
-    channelId: string;
-    threadName: string;
-    initialMessage: string;
-  }): Promise<{ threadId: string; firstMessageId: string }>;
-}
+// DiscordPoster kept as a re-export alias for backward compatibility.
+export type { MessengerAdapter as DiscordPoster };
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -203,7 +190,8 @@ interface DiscordAdapterOpts {
   db: Database.Database;
 }
 
-export class DiscordAdapter implements DiscordPoster {
+export class DiscordAdapter implements MessengerAdapter {
+  readonly platform = 'discord';
   private readonly config: AppConfig;
   private readonly db: Database.Database;
   private readonly client: Client;
@@ -370,7 +358,7 @@ export class DiscordAdapter implements DiscordPoster {
 
     let decision;
     try {
-      decision = await routeDiscord({ ctx, config: this.config, db: this.db });
+      decision = await routeMessage({ ctx, config: this.config, db: this.db });
     } catch (err) {
       log.error(
         { err: (err as Error).message, channel: ctx.channelName ?? ctx.channelId },
@@ -422,7 +410,7 @@ export class DiscordAdapter implements DiscordPoster {
     }
   }
 
-  private async buildContext(msg: Message): Promise<DiscordMessageContext> {
+  private async buildContext(msg: Message): Promise<MessageContext> {
     const channel = msg.channel;
     const isDm = channel.isDMBased();
     const isThread = channel.isThread();
@@ -473,6 +461,7 @@ export class DiscordAdapter implements DiscordPoster {
     }));
 
     return {
+      platform: 'discord',
       channelId: routingChannelId,
       channelName,
       threadId,
@@ -492,7 +481,7 @@ export class DiscordAdapter implements DiscordPoster {
 
   private async handleRepoWork(
     msg: Message,
-    ctx: DiscordMessageContext,
+    ctx: MessageContext,
     repo: RepoEntry,
     _instructions: string | undefined,
   ): Promise<void> {
@@ -541,7 +530,7 @@ export class DiscordAdapter implements DiscordPoster {
   }
 
   private async runRepoWorkInThread(
-    ctx: DiscordMessageContext,
+    ctx: MessageContext,
     repo: RepoEntry,
     target: TargetChannel,
     threadKey: string,
@@ -691,7 +680,7 @@ export class DiscordAdapter implements DiscordPoster {
 
   private async handleClawMaintenance(
     msg: Message,
-    ctx: DiscordMessageContext,
+    ctx: MessageContext,
   ): Promise<void> {
     const channel = msg.channel;
     const isThread = channel.isThread();
@@ -729,7 +718,7 @@ export class DiscordAdapter implements DiscordPoster {
   }
 
   private async runClawMaintenanceInThread(
-    ctx: DiscordMessageContext,
+    ctx: MessageContext,
     target: TargetChannel,
     threadKey: string,
     threadContext?: string,

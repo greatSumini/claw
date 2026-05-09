@@ -44,7 +44,7 @@ async function main(): Promise<void> {
   let gmail: GmailAdapter | null = null;
   const gmailReady = config.gmail.length > 0 && config.env.GMAIL_CLIENT_ID && config.env.GMAIL_CLIENT_SECRET;
   if (gmailReady) {
-    gmail = new GmailAdapter({ config, db, discord });
+    gmail = new GmailAdapter({ config, db, poster: discord });
     await gmail.start();
     log.info({ accounts: config.gmail.length }, 'gmail adapter started');
   } else {

@@ -82,11 +82,13 @@ describe('state: migrations', () => {
     runMigrations(db);
     runMigrations(db);
     const rows = db
-      .prepare<[], { name: string }>('SELECT name FROM _migrations')
+      .prepare<[], { name: string }>('SELECT name FROM _migrations ORDER BY name')
       .all();
-    // Only one row per migration despite multiple runs.
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0]!.name, '001_init');
+    // Each migration appears exactly once despite multiple runMigrations calls.
+    const names = rows.map((r) => r.name);
+    assert.deepEqual(names, [...new Set(names)], 'duplicate migration rows found');
+    assert.ok(names.includes('001_init'));
+    assert.ok(names.includes('002_session_analyses'));
   });
 
   test('getDb caches instances per path', () => {

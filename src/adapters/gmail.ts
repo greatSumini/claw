@@ -22,21 +22,15 @@ import {
 import { classifyMail } from '../orchestrator/importance.js';
 import type { ImportanceVerdict, MailSummary } from '../orchestrator/types.js';
 import { emitEvent } from '../dashboard/event-bus.js';
+import type { MailAlertPoster } from '../messenger/types.js';
 
-// Local interface — duplicated rather than imported to avoid pulling in
-// discord.js side effects for tests / shape verification.
-export interface DiscordPoster {
-  postMailAlert(args: {
-    channelId: string;
-    threadName: string;
-    initialMessage: string;
-  }): Promise<{ threadId: string; firstMessageId: string }>;
-}
+// Re-exported for backward compat (was a local interface here previously).
+export type { MailAlertPoster as DiscordPoster };
 
 interface GmailAdapterOpts {
   config: AppConfig;
   db: Database.Database;
-  discord: DiscordPoster;
+  poster: MailAlertPoster;
 }
 
 interface AccountRuntime {
@@ -219,7 +213,7 @@ function truncateThreadName(s: string, max = THREAD_NAME_MAX): string {
 export class GmailAdapter {
   private readonly config: AppConfig;
   private readonly db: Database.Database;
-  private readonly discord: DiscordPoster;
+  private readonly poster: MailAlertPoster;
   private readonly runtimes: AccountRuntime[];
   private readonly intervalMs: number;
 
@@ -230,7 +224,7 @@ export class GmailAdapter {
   constructor(opts: GmailAdapterOpts) {
     this.config = opts.config;
     this.db = opts.db;
-    this.discord = opts.discord;
+    this.poster = opts.poster;
     this.intervalMs = Math.max(
       30_000,
       opts.config.env.MAIL_POLL_INTERVAL_SEC * 1000,
@@ -575,7 +569,7 @@ export class GmailAdapter {
 
     let posted: { threadId: string; firstMessageId: string };
     try {
-      posted = await this.discord.postMailAlert({
+      posted = await this.poster.postMailAlert({
         channelId: this.config.mailAlertChannelId,
         threadName,
         initialMessage: body,

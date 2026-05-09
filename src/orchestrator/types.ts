@@ -1,22 +1,9 @@
 import type { RepoEntry } from '../config.js';
+import type { MessageContext } from '../messenger/types.js';
 
-export interface DiscordMessageContext {
-  channelId: string;
-  /** Channel name, e.g. "vmc-context-hub", "일반". Optional — adapters may not always know. */
-  channelName?: string;
-  /** null = top-level channel post (not inside a thread) */
-  threadId: string | null;
-  authorId: string;
-  authorName: string;
-  text: string;
-  /** True if claw was @-mentioned in this message. */
-  isMention: boolean;
-  /** True if this message arrived via DM. Adapters set this. */
-  isDm?: boolean;
-  /** True if the message author is the claw bot itself (defense-in-depth). */
-  isBot?: boolean;
-  attachments?: Array<{ name: string; url: string }>;
-}
+export type { MessageContext };
+// Kept as alias so existing internal references in discord.ts compile without churn.
+export type DiscordMessageContext = MessageContext;
 
 export type RouteDecision =
   | { kind: 'trivial'; answer: string }

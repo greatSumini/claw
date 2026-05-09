@@ -1,5 +1,5 @@
 export * from './types.js';
-export { routeDiscord } from './router.js';
+export { routeMessage, routeMessage as routeDiscord } from './router.js';
 export { classifyMail } from './importance.js';
 export {
   buildRepoWorkSystemAppend,

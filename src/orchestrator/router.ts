@@ -5,7 +5,7 @@ import type { AppConfig, RepoEntry } from '../config.js';
 import { runClaude, ClaudeError } from '../claude.js';
 import { log } from '../log.js';
 import { logEvent } from '../state/events.js';
-import type { DiscordMessageContext, RouteDecision } from './types.js';
+import type { MessageContext, RouteDecision } from './types.js';
 
 const CLASSIFIER_TIMEOUT_MS = 30_000;
 const SCRATCH_DIR_NAME = 'router-scratch';
@@ -162,8 +162,8 @@ function findRepoByFullName(config: AppConfig, fullName: string): RepoEntry | un
  * - General channel → require mention or thread; classify via claude
  * - DM → classify via claude unconditionally
  */
-export async function routeDiscord(args: {
-  ctx: DiscordMessageContext;
+export async function routeMessage(args: {
+  ctx: MessageContext;
   config: AppConfig;
   db: Database.Database;
 }): Promise<RouteDecision> {
