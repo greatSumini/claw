@@ -37,6 +37,8 @@ const Schema = z.object({
 
 export type Env = z.infer<typeof Schema>;
 
+export type EngineName = 'claude-code' | 'codex';
+
 export interface RepoEntry {
   /** Discord channel name → repo */
   channelName: string;
@@ -50,6 +52,8 @@ export interface RepoEntry {
   category: 'personal' | 'code';
   /** Short description for prompts */
   description: string;
+  /** LLM engine to use for this repo. Defaults to 'claude-code'. */
+  engine?: EngineName;
 }
 
 export interface GmailAccount {

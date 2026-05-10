@@ -20,6 +20,7 @@ import type Database from 'better-sqlite3';
 import type { AppConfig, RepoEntry } from '../config.js';
 import { log } from '../log.js';
 import { runClaude, ClaudeError } from '../claude.js';
+import { runCodex } from '../codex.js';
 import { getSession, upsertSession } from '../state/sessions.js';
 import { logEvent } from '../state/events.js';
 import { emitEvent } from '../dashboard/event-bus.js';
@@ -652,7 +653,8 @@ export class DiscordAdapter implements MessengerAdapter {
 
       let result;
       try {
-        result = await runClaude({
+        const runner = repo.engine === 'codex' ? runCodex : runClaude;
+        result = await runner({
           cwd: repo.localPath,
           prompt: userMessage,
           systemAppend,
@@ -663,7 +665,7 @@ export class DiscordAdapter implements MessengerAdapter {
         const e = err instanceof ClaudeError ? err : (err as Error);
         log.error(
           { err: e.message, channel: channelLabel, threadId: threadKey, repo: repo.fullName },
-          'claude run failed in repo-work',
+          'engine run failed in repo-work',
         );
         logEvent(this.db, {
           type: 'claude.error',
