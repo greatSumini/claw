@@ -16,3 +16,63 @@ __CLAW_RESTART__
 # 잘못된 예 (Discord에 빈 메시지 전송됨)
 __CLAW_RESTART__
 ```
+
+---
+
+## Skills 시스템
+
+### 개요
+
+claw는 자체 skill 감지·주입 시스템을 갖는다. 유저 메시지가 들어오면 Haiku가 적합한 skill을 감지하고, 해당 skill의 내용을 메인 LLM 호출 시 systemAppend에 자동 주입한다.
+
+### 디렉토리 구조
+
+```
+claw/
+└── skills/
+    └── {skill-name}/
+        └── SKILL.md      # 필수. frontmatter에 name, description, triggers 포함
+```
+
+### SKILL.md 포맷
+
+```markdown
+---
+name: skill-name
+description: 한 줄 설명 (Haiku 분류기가 skill 선택 시 사용)
+triggers:
+  - 트리거 키워드/패턴 예시 1
+  - 트리거 키워드/패턴 예시 2
+---
+
+# (skill 본문 — 메인 LLM systemAppend에 주입되는 실제 내용)
+```
+
+### Claw skill vs Repo skill 구분 원칙
+
+| 기준 | Claw skill | Repo (Claude Code) skill |
+|------|-----------|--------------------------|
+| 저장 위치 | `claw/skills/` | `{repo}/.claude/skills/` |
+| 주입 주체 | claw 오케스트레이터 (세션 시작 전) | Claude Code 에이전트 (세션 도중) |
+| 대상 | 인터랙션 패턴 / 커뮤니케이션 방식 | 코드베이스 내 구현 패턴 |
+| 핵심 질문 | "레포가 달라져도 이 지식이 필요한가?" | "이 레포 코드를 알아야 쓸 수 있는가?" |
+
+**Claw skill에 속하는 것:**
+- 커뮤니케이션 (B2B 이메일 초안, 캘린더 미팅 협의)
+- claw 시스템 자체 지식 (디버그, 재시작 패턴, 아키텍처)
+- 레포에 무관하게 반복되는 크로스커팅 인터랙션 패턴
+
+**Repo skill에 속하는 것:**
+- 레포 내 코드 생성/수정 패턴 (API 추가, DB 쿼리 등)
+- 레포 전용 CLI/스크립트 사용법
+- 해당 레포 코드베이스 지식 없이는 쓸 수 없는 것
+
+**중복 시:** repo skill로 단일화. claw skill은 repo skill 호출을 유도하는 힌트만 제공.
+
+### "이건 claw skill로 추가해두자" 명령 처리
+
+유저가 위 표현으로 명령하면:
+1. `skills/{적절한-이름}/SKILL.md` 파일 생성
+2. frontmatter에 name, description, triggers 작성
+3. 본문에 주입할 실제 지침 내용 작성
+4. git commit & push (소스 변경 아니므로 `pnpm build` 불필요, 재시작 마커 불필요)
