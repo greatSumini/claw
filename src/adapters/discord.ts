@@ -1152,30 +1152,49 @@ export class DiscordAdapter implements MessengerAdapter {
       return;
     }
 
-    // Fetch the original thread and post the analysis.
-    let thread;
-    try {
-      thread = await this.client.channels.fetch(threadId);
-    } catch {
-      log.warn({ threadId }, 'analysis: original thread not found');
-      return;
-    }
-    if (!thread || !thread.isTextBased() || !('send' in thread)) {
-      log.warn({ threadId }, 'analysis: thread not text-sendable');
-      return;
-    }
-    const sendable = thread as unknown as TextSendable;
-
     const { text: visibleText } = extractRestartMarker(result.text);
-    const header = '**[자동 분석 리포트]**\n\n';
-    const chunks = splitMessage(header + visibleText, SAFE_CHUNK_SIZE);
-    for (const chunk of chunks) {
-      try {
-        await safeSend(sendable, chunk);
-      } catch (err) {
-        log.error({ err: (err as Error).message, threadId }, 'analysis: send failed');
-        break;
+    const repoShort = repoLabel.split('/').pop() ?? repoLabel;
+    const dateStr = new Date().toISOString().slice(0, 10);
+
+    // 1. Post the full report to a new thread in the claw channel.
+    //    Thread parentId = clawChannelId → follow-ups auto-route as claw-maintenance.
+    let analysisThreadId: string | null = null;
+    try {
+      const clawChannel = await this.client.channels.fetch(this.config.clawChannelId);
+      if (clawChannel && clawChannel.isTextBased() && 'send' in clawChannel) {
+        const clawSendable = clawChannel as unknown as TextSendable;
+        const header = `**[자동 분석 리포트]** — \`${repoLabel}\` · 원본: <#${threadId}>\n\n`;
+        const chunks = splitMessage(header + visibleText, SAFE_CHUNK_SIZE);
+        const firstMsg = await clawSendable.send(chunks[0] ?? '');
+        const threadName = truncate(`[분석] ${repoShort} · ${dateStr}`, THREAD_NAME_MAX);
+        const newThread = await firstMsg.startThread({
+          name: threadName,
+          autoArchiveDuration: DEFAULT_AUTO_ARCHIVE_MIN,
+        });
+        analysisThreadId = newThread.id;
+        for (const chunk of chunks.slice(1)) {
+          try {
+            await newThread.send(chunk);
+          } catch (err) {
+            log.error({ err: (err as Error).message }, 'analysis: claw thread chunk send failed');
+          }
+        }
       }
+    } catch (err) {
+      log.error({ err: (err as Error).message }, 'analysis: failed to post to claw channel');
+    }
+
+    // 2. Notify the original thread with a link to the claw channel analysis thread.
+    try {
+      const originalThread = await this.client.channels.fetch(threadId);
+      if (originalThread && originalThread.isTextBased() && 'send' in originalThread) {
+        const notice = analysisThreadId
+          ? `**[자동 분석 리포트]** 작성 완료 → <#${analysisThreadId}>`
+          : `**[자동 분석 리포트]** 작성 완료 (claw 채널 확인)`;
+        await (originalThread as unknown as TextSendable).send(notice);
+      }
+    } catch (err) {
+      log.warn({ err: (err as Error).message, threadId }, 'analysis: original thread notify failed');
     }
 
     upsertSessionAnalysis(this.db, {
@@ -1186,7 +1205,7 @@ export class DiscordAdapter implements MessengerAdapter {
       status: 'done',
     });
 
-    log.info({ threadId, sessionId: result.sessionId }, 'analysis: posted');
+    log.info({ threadId, sessionId: result.sessionId, analysisThreadId }, 'analysis: posted to claw channel');
   }
 
   // -------------------------------------------------------------------------
