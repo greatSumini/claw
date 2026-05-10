@@ -17,7 +17,8 @@ interface SkillEntry {
   content: string;
 }
 
-function parseFrontmatter(text: string): { meta: Record<string, string>; body: string } {
+/** @internal exported for testing */
+export function parseFrontmatter(text: string): { meta: Record<string, string>; body: string } {
   const match = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(text);
   if (!match) return { meta: {}, body: text };
 
@@ -33,7 +34,8 @@ function parseFrontmatter(text: string): { meta: Record<string, string>; body: s
   return { meta, body: match[2].trim() };
 }
 
-async function loadSkills(skillsDir: string): Promise<SkillEntry[]> {
+/** @internal exported for testing */
+export async function loadSkills(skillsDir: string): Promise<SkillEntry[]> {
   if (!existsSync(skillsDir)) return [];
 
   let entries;

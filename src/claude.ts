@@ -52,11 +52,20 @@ interface CliCapabilities {
   appendSystemPrompt: boolean;
 }
 
-const CLAUDE_BIN = process.env.CLAUDE_BIN ?? 'claude';
 const DEFAULT_TIMEOUT_MS = 600_000;
 const SIGKILL_GRACE_MS = 5_000;
 
+/** Read at call time so tests can override process.env.CLAUDE_BIN. */
+function getClaudeBin(): string {
+  return process.env['CLAUDE_BIN'] ?? 'claude';
+}
+
 let capabilitiesPromise: Promise<CliCapabilities> | null = null;
+
+/** Reset cached CLI capabilities — test use only. */
+export function _resetCapabilitiesForTest(): void {
+  capabilitiesPromise = null;
+}
 
 function detectCapabilities(): Promise<CliCapabilities> {
   if (capabilitiesPromise) return capabilitiesPromise;
@@ -89,7 +98,7 @@ function detectCapabilities(): Promise<CliCapabilities> {
 
 function runHelp(): Promise<string> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(CLAUDE_BIN, ['--help'], {
+    const proc = spawn(getClaudeBin(), ['--help'], {
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -246,7 +255,7 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
     );
 
     return await new Promise<ClaudeRunResult>((resolve, reject) => {
-      const proc = spawn(CLAUDE_BIN, args, {
+      const proc = spawn(getClaudeBin(), args, {
         cwd: opts.cwd,
         env: process.env,
         stdio: ['pipe', 'pipe', 'pipe'],
