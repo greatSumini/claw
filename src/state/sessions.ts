@@ -7,6 +7,8 @@ export interface SessionRow {
   cwd: string;
   createdAt: string;
   updatedAt: string;
+  lastSkill: string | null;
+  lastResponse: string | null;
 }
 
 interface SessionDbRow {
@@ -16,6 +18,8 @@ interface SessionDbRow {
   cwd: string;
   created_at: string;
   updated_at: string;
+  last_skill: string | null;
+  last_response: string | null;
 }
 
 function fromRow(row: SessionDbRow): SessionRow {
@@ -26,13 +30,15 @@ function fromRow(row: SessionDbRow): SessionRow {
     cwd: row.cwd,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    lastSkill: row.last_skill ?? null,
+    lastResponse: row.last_response ?? null,
   };
 }
 
 export function getSession(db: Database.Database, threadId: string): SessionRow | null {
   if (!threadId) throw new Error('getSession: threadId is required');
   const stmt = db.prepare<[string], SessionDbRow>(
-    'SELECT thread_id, claude_session_id, repo, cwd, created_at, updated_at FROM sessions WHERE thread_id = ?',
+    'SELECT thread_id, claude_session_id, repo, cwd, created_at, updated_at, last_skill, last_response FROM sessions WHERE thread_id = ?',
   );
   const row = stmt.get(threadId);
   return row ? fromRow(row) : null;
@@ -43,6 +49,8 @@ export interface UpsertSessionArgs {
   claudeSessionId: string;
   repo: string;
   cwd: string;
+  lastSkill?: string | null;
+  lastResponse?: string | null;
 }
 
 export function upsertSession(db: Database.Database, args: UpsertSessionArgs): void {
@@ -53,14 +61,15 @@ export function upsertSession(db: Database.Database, args: UpsertSessionArgs): v
 
   const now = new Date().toISOString();
 
-  // Use INSERT ... ON CONFLICT to preserve created_at on update
   const stmt = db.prepare(
-    `INSERT INTO sessions (thread_id, claude_session_id, repo, cwd, created_at, updated_at)
-     VALUES (@threadId, @claudeSessionId, @repo, @cwd, @now, @now)
+    `INSERT INTO sessions (thread_id, claude_session_id, repo, cwd, last_skill, last_response, created_at, updated_at)
+     VALUES (@threadId, @claudeSessionId, @repo, @cwd, @lastSkill, @lastResponse, @now, @now)
      ON CONFLICT(thread_id) DO UPDATE SET
        claude_session_id = excluded.claude_session_id,
        repo              = excluded.repo,
        cwd               = excluded.cwd,
+       last_skill        = excluded.last_skill,
+       last_response     = excluded.last_response,
        created_at        = COALESCE(sessions.created_at, excluded.created_at),
        updated_at        = excluded.updated_at`,
   );
@@ -70,6 +79,8 @@ export function upsertSession(db: Database.Database, args: UpsertSessionArgs): v
     claudeSessionId: args.claudeSessionId,
     repo: args.repo,
     cwd: args.cwd,
+    lastSkill: args.lastSkill ?? null,
+    lastResponse: args.lastResponse ?? null,
     now,
   });
 }
@@ -85,7 +96,7 @@ export function listRecentSessions(db: Database.Database, limit = 50): SessionRo
     throw new Error('listRecentSessions: limit must be a positive integer');
   }
   const stmt = db.prepare<[number], SessionDbRow>(
-    'SELECT thread_id, claude_session_id, repo, cwd, created_at, updated_at FROM sessions ORDER BY updated_at DESC LIMIT ?',
+    'SELECT thread_id, claude_session_id, repo, cwd, created_at, updated_at, last_skill, last_response FROM sessions ORDER BY updated_at DESC LIMIT ?',
   );
   const rows = stmt.all(limit);
   return rows.map(fromRow);

@@ -80,6 +80,13 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    name: '004_session_skill_cache',
+    sql: `
+      ALTER TABLE sessions ADD COLUMN last_skill TEXT;
+      ALTER TABLE sessions ADD COLUMN last_response TEXT;
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

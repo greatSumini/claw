@@ -30,6 +30,7 @@ import {
   buildAnalysisSystemAppend,
   CLAW_RESTART_MARKER,
 } from '../orchestrator/prompt.js';
+import { detectSkill, truncateForCache } from '../orchestrator/skill-detector.js';
 import {
   buildConversationTranscript,
   buildAnalysisPrompt,
@@ -610,14 +611,29 @@ export class DiscordAdapter implements MessengerAdapter {
     const stopTyping = startTyping(target.channel);
 
     try {
-      const savedPaths = await downloadAttachments(ctx.attachments ?? []);
+      const skillsDir = path.join(this.config.clawRepoPath, 'skills');
+
+      // 첨부파일 다운로드 + skill 탐지 병렬 실행
+      const [savedPaths, skillResult] = await Promise.all([
+        downloadAttachments(ctx.attachments ?? []),
+        detectSkill({
+          userMessage: ctx.text,
+          previousResponse: sessionRow?.lastResponse ?? null,
+          cachedSkill: sessionRow?.lastSkill ?? null,
+          skillsDir,
+        }),
+      ]);
+
       const baseText = ctx.text + attachmentNote(savedPaths);
       const userMessage = threadContext ? `${threadContext}\n\n${baseText}` : baseText;
-      const systemAppend = buildRepoWorkSystemAppend({
+      const baseSystemAppend = buildRepoWorkSystemAppend({
         userMessage,
         repo,
         isContinuation: Boolean(resumeId),
       });
+      const systemAppend = skillResult.content
+        ? `# 활성 Skill: ${skillResult.skill}\n\n${skillResult.content}\n\n---\n${baseSystemAppend}`
+        : baseSystemAppend;
 
       logEvent(this.db, {
         type: 'claude.invoke',
@@ -695,6 +711,8 @@ export class DiscordAdapter implements MessengerAdapter {
           claudeSessionId: result.sessionId,
           repo: repo.fullName,
           cwd: repo.localPath,
+          lastSkill: skillResult.skill,
+          lastResponse: truncateForCache(result.text),
         });
       } catch (err) {
         log.error(
@@ -796,12 +814,27 @@ export class DiscordAdapter implements MessengerAdapter {
     const stopTyping = startTyping(target.channel);
 
     try {
-      const savedPaths = await downloadAttachments(ctx.attachments ?? []);
+      const skillsDir = path.join(cwd, 'skills');
+
+      // 첨부파일 다운로드 + skill 탐지 병렬 실행
+      const [savedPaths, skillResult] = await Promise.all([
+        downloadAttachments(ctx.attachments ?? []),
+        detectSkill({
+          userMessage: ctx.text,
+          previousResponse: sessionRow?.lastResponse ?? null,
+          cachedSkill: sessionRow?.lastSkill ?? null,
+          skillsDir,
+        }),
+      ]);
+
       const baseText = ctx.text + attachmentNote(savedPaths);
       const userMessage = threadContext ? `${threadContext}\n\n${baseText}` : baseText;
-      const systemAppend = buildClawMaintenanceSystemAppend({
+      const baseSystemAppend = buildClawMaintenanceSystemAppend({
         isContinuation: Boolean(resumeId),
       });
+      const systemAppend = skillResult.content
+        ? `# 활성 Skill: ${skillResult.skill}\n\n${skillResult.content}\n\n---\n${baseSystemAppend}`
+        : baseSystemAppend;
 
       logEvent(this.db, {
         type: 'claude.invoke',
@@ -896,6 +929,8 @@ export class DiscordAdapter implements MessengerAdapter {
           claudeSessionId: result.sessionId,
           repo: 'greatSumini/claw',
           cwd,
+          lastSkill: skillResult.skill,
+          lastResponse: truncateForCache(visibleText),
         });
       } catch (err) {
         log.error(

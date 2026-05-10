@@ -13,6 +13,8 @@ export interface ClaudeRunOptions {
   resume?: string;
   /** Additional system-style instructions. Will be appended after the prompt with a "---" separator. */
   systemAppend?: string;
+  /** Override model (e.g. 'claude-haiku-4-5-20251001'). Defaults to CLI's configured model. */
+  model?: string;
   /** Cancellation. Default: none. */
   signal?: AbortSignal;
   /** Hard timeout in ms. Default 600_000 (10 min). */
@@ -124,6 +126,9 @@ function buildArgs(opts: ClaudeRunOptions, caps: CliCapabilities): string[] {
   }
   if (opts.resume) {
     args.push('--resume', opts.resume);
+  }
+  if (opts.model) {
+    args.push('--model', opts.model);
   }
   return args;
 }
