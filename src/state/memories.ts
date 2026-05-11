@@ -401,32 +401,22 @@ export function loadRelevantMemories(
   }
 
   const scored = memories.map((mem) => {
-    // "절대 기억": score >= 75는 항상 포함
-    const isAbsolute = mem.score >= 75;
-
     const searchText = [...mem.tags, mem.value].join(' ').toLowerCase();
     const relevance = keywords.filter((kw) => searchText.includes(kw)).length;
-
-    return { mem, relevance, isAbsolute };
+    return { mem, relevance };
   });
 
   const maxRelevance = Math.max(...scored.map((s) => s.relevance), 1);
 
-  const sorted = scored
-    .filter((s) => s.isAbsolute || s.relevance > 0)
+  return scored
+    .filter((s) => s.relevance > 0)
     .sort((a, b) => {
       const scoreA = a.mem.score * 0.7 + (a.relevance / maxRelevance) * 30;
       const scoreB = b.mem.score * 0.7 + (b.relevance / maxRelevance) * 30;
       return scoreB - scoreA;
-    });
-
-  // Ensure absolute memories are always present; fill up to maxCount with sorted results
-  const absolute = scored.filter((s) => s.isAbsolute).map((s) => s.mem);
-  const absoluteIds = new Set(absolute.map((m) => m.id));
-  const rest = sorted.filter((s) => !absoluteIds.has(s.mem.id)).map((s) => s.mem);
-
-  const combined = [...absolute, ...rest];
-  return combined.slice(0, maxCount);
+    })
+    .slice(0, maxCount)
+    .map((s) => s.mem);
 }
 
 // ---------------------------------------------------------------------------
