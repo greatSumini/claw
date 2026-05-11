@@ -87,6 +87,46 @@ const MIGRATIONS: Migration[] = [
       ALTER TABLE sessions ADD COLUMN last_response TEXT;
     `,
   },
+  {
+    name: '005_events_fts',
+    sql: `
+      CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+        summary,
+        content='events',
+        content_rowid='id',
+        tokenize='unicode61'
+      );
+
+      INSERT INTO events_fts(events_fts) VALUES('rebuild');
+
+      CREATE TRIGGER IF NOT EXISTS events_fts_ins AFTER INSERT ON events BEGIN
+        INSERT INTO events_fts(rowid, summary) VALUES (new.id, new.summary);
+      END;
+      CREATE TRIGGER IF NOT EXISTS events_fts_upd AFTER UPDATE ON events BEGIN
+        INSERT INTO events_fts(events_fts, rowid, summary) VALUES ('delete', old.id, old.summary);
+        INSERT INTO events_fts(rowid, summary) VALUES (new.id, new.summary);
+      END;
+      CREATE TRIGGER IF NOT EXISTS events_fts_del AFTER DELETE ON events BEGIN
+        INSERT INTO events_fts(events_fts, rowid, summary) VALUES ('delete', old.id, old.summary);
+      END;
+    `,
+  },
+  {
+    name: '006_skill_proposals',
+    sql: `
+      CREATE TABLE IF NOT EXISTS skill_proposals (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts              TEXT NOT NULL,
+        kind            TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        description     TEXT NOT NULL,
+        content         TEXT NOT NULL,
+        repo_full_name  TEXT,
+        source_thread_id TEXT,
+        status          TEXT NOT NULL DEFAULT 'pending'
+      );
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

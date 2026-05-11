@@ -1,6 +1,45 @@
 import type Database from 'better-sqlite3';
 import { listEventsByThread } from '../state/events.js';
 
+// ---------------------------------------------------------------------------
+// Skill proposal parsing
+// ---------------------------------------------------------------------------
+
+export interface SkillProposalData {
+  kind: 'claw' | 'repo';
+  name: string;
+  description: string;
+  content: string;
+  repoFullName?: string;
+}
+
+const PROPOSALS_BLOCK_REGEX = /<!--\s*SKILL_PROPOSALS:\s*([\s\S]*?)-->/;
+
+export function parseSkillProposals(text: string): SkillProposalData[] {
+  const match = PROPOSALS_BLOCK_REGEX.exec(text);
+  if (!match) return [];
+  try {
+    const arr = JSON.parse(match[1].trim()) as unknown;
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((item): item is SkillProposalData => {
+      if (!item || typeof item !== 'object') return false;
+      const o = item as Record<string, unknown>;
+      return (
+        (o.kind === 'claw' || o.kind === 'repo') &&
+        typeof o.name === 'string' && o.name.length > 0 &&
+        typeof o.description === 'string' && o.description.length > 0 &&
+        typeof o.content === 'string' && o.content.length > 0
+      );
+    });
+  } catch {
+    return [];
+  }
+}
+
+export function stripSkillProposalsBlock(text: string): string {
+  return text.replace(PROPOSALS_BLOCK_REGEX, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 /**
  * Build a human-readable transcript from a thread's event history.
  * Only includes inbound user messages and outbound claw responses.
@@ -51,5 +90,11 @@ export function buildAnalysisPrompt(
     '   - 해당 없으면 각각 "없음".',
     '',
     '분석 결과(반복 패턴, 각 개선 제안의 내용·구현 방법·우선순위, skill 제안)를 항목별로 **상세히** 제시해라. 내용 생략 금지.',
+    '',
+    '---',
+    '',
+    '분析 텍스트 출력 후 **마지막 줄**에 반드시 아래 블록을 추가하라 (JSON 한 줄, skill 후보 없으면 빈 배열):',
+    `<!-- SKILL_PROPOSALS: [{"kind":"claw","name":"영문-이름","description":"한 줄 설명","content":"---\\nname: 이름\\ndescription: 설명\\ntriggers:\\n  - 키워드\\n---\\n\\n# 내용"},{"kind":"repo","name":"영문-이름","description":"한 줄 설명","content":"---\\nname: 이름\\n---\\n\\n# 내용","repoFullName":"${repo}"}] -->`,
+    'name은 영문 소문자+하이픈만. content의 개행은 \\n. 후보 없으면: <!-- SKILL_PROPOSALS: [] -->',
   ].join('\n');
 }

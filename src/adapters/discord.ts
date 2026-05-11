@@ -1,4 +1,5 @@
 import { spawn, execFile } from 'node:child_process';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import {
@@ -22,7 +23,7 @@ import { log } from '../log.js';
 import { runClaude, ClaudeError } from '../claude.js';
 import { runCodex } from '../codex.js';
 import { getSession, upsertSession } from '../state/sessions.js';
-import { logEvent } from '../state/events.js';
+import { logEvent, searchEvents, type EventSearchResult } from '../state/events.js';
 import { emitEvent } from '../dashboard/event-bus.js';
 import { routeMessage } from '../orchestrator/router.js';
 import {
@@ -35,7 +36,15 @@ import { detectSkill, truncateForCache } from '../orchestrator/skill-detector.js
 import {
   buildConversationTranscript,
   buildAnalysisPrompt,
+  parseSkillProposals,
+  stripSkillProposalsBlock,
 } from '../orchestrator/auto-analysis.js';
+import {
+  insertSkillProposal,
+  getSkillProposal,
+  updateSkillProposalStatus,
+  type SkillProposal,
+} from '../state/skill-proposals.js';
 import type { MessageContext } from '../messenger/types.js';
 import type { MessengerAdapter } from '../messenger/types.js';
 import { downloadAttachments, attachmentNote } from '../attachments.js';
@@ -75,6 +84,18 @@ export function parseIgnoreSenderButtonId(
   const account = rest.slice(colonIdx + 1);
   if (!email || !account) return null;
   return { email, account };
+}
+
+const CREATE_SKILL_PREFIX = 'create-skill';
+
+export function buildCreateSkillButtonId(proposalId: number): string {
+  return `${CREATE_SKILL_PREFIX}:${proposalId}`;
+}
+
+export function parseCreateSkillButtonId(customId: string): number | null {
+  if (!customId.startsWith(`${CREATE_SKILL_PREFIX}:`)) return null;
+  const id = parseInt(customId.slice(CREATE_SKILL_PREFIX.length + 1), 10);
+  return Number.isFinite(id) ? id : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -356,24 +377,30 @@ export class DiscordAdapter implements MessengerAdapter {
   // -------------------------------------------------------------------------
 
   private async onButtonInteraction(interaction: ButtonInteraction): Promise<void> {
-    const parsed = parseIgnoreSenderButtonId(interaction.customId);
-    if (!parsed) return;
+    // ignore-sender button
+    const ignoreParsed = parseIgnoreSenderButtonId(interaction.customId);
+    if (ignoreParsed) {
+      const { email, account } = ignoreParsed;
+      setSenderPolicy(this.db, { email, account, policy: 'ignore', reason: 'Discord 버튼으로 무시 설정' });
+      log.info({ email, account }, 'sender ignored via button');
+      logEvent(this.db, {
+        type: 'importance.classify',
+        summary: `button ignore: ${email}`,
+        meta: { mode: 'button', verdict: 'ignore', from: email, account },
+      });
+      await interaction.reply({
+        content: `앞으로 **${email}** 발신자의 메일은 무시합니다.`,
+        flags: 64,
+      });
+      return;
+    }
 
-    const { email, account } = parsed;
-
-    setSenderPolicy(this.db, { email, account, policy: 'ignore', reason: 'Discord 버튼으로 무시 설정' });
-
-    log.info({ email, account }, 'sender ignored via button');
-    logEvent(this.db, {
-      type: 'importance.classify',
-      summary: `button ignore: ${email}`,
-      meta: { mode: 'button', verdict: 'ignore', from: email, account },
-    });
-
-    await interaction.reply({
-      content: `앞으로 **${email}** 발신자의 메일은 무시합니다.`,
-      flags: 64, // ephemeral
-    });
+    // create-skill button
+    const proposalId = parseCreateSkillButtonId(interaction.customId);
+    if (proposalId !== null) {
+      await this.handleCreateSkillButton(interaction, proposalId);
+      return;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -421,6 +448,13 @@ export class DiscordAdapter implements MessengerAdapter {
       threadId: ctx.threadId ?? undefined,
       summary: ctx.text.slice(0, 500),
     });
+
+    // /search shortcut — intercept before routing pipeline.
+    if (ctx.text.startsWith('/search')) {
+      const query = ctx.text.slice('/search'.length).trim();
+      await this.handleSearchCommand(query, msg);
+      return;
+    }
 
     let decision;
     try {
@@ -1027,6 +1061,124 @@ export class DiscordAdapter implements MessengerAdapter {
   }
 
   // -------------------------------------------------------------------------
+  // Skill creation (button handler)
+  // -------------------------------------------------------------------------
+
+  private async handleCreateSkillButton(
+    interaction: ButtonInteraction,
+    proposalId: number,
+  ): Promise<void> {
+    const proposal = getSkillProposal(this.db, proposalId);
+    if (!proposal) {
+      await interaction.reply({ content: '제안을 찾을 수 없습니다 (이미 처리됨?).', flags: 64 });
+      return;
+    }
+    if (proposal.status !== 'pending') {
+      await interaction.reply({ content: `이미 처리됨: ${proposal.status}`, flags: 64 });
+      return;
+    }
+
+    await interaction.deferReply({ flags: 64 });
+
+    try {
+      if (proposal.kind === 'claw') {
+        await this.createClawSkill(proposal);
+      } else {
+        await this.createRepoSkill(proposal);
+      }
+      updateSkillProposalStatus(this.db, proposalId, 'created');
+      await interaction.editReply({ content: `✅ \`${proposal.name}\` skill 생성 완료!` });
+      log.info({ proposalId, name: proposal.name, kind: proposal.kind }, 'skill proposal created');
+    } catch (err) {
+      log.error({ err: (err as Error).message, proposalId }, 'create-skill button: failed');
+      await interaction.editReply({ content: `❌ 생성 실패: ${(err as Error).message}` });
+    }
+  }
+
+  private async createClawSkill(proposal: SkillProposal): Promise<void> {
+    const skillDir = path.join(this.config.clawRepoPath, 'skills', proposal.name);
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(path.join(skillDir, 'SKILL.md'), proposal.content, 'utf8');
+
+    const repoPath = this.config.clawRepoPath;
+    await execFileAsync('git', ['-C', repoPath, 'add', `skills/${proposal.name}/SKILL.md`]);
+    await execFileAsync('git', ['-C', repoPath, 'commit', '-m', `feat: skill 자동 생성 — ${proposal.name}`]);
+    await execFileAsync('git', ['-C', repoPath, 'push']);
+  }
+
+  private async createRepoSkill(proposal: SkillProposal): Promise<void> {
+    if (!proposal.repoFullName) throw new Error('repoFullName required for repo skill');
+    const repoEntry = this.config.repoChannels.find((r) => r.fullName === proposal.repoFullName);
+    if (!repoEntry) throw new Error(`repo not registered: ${proposal.repoFullName}`);
+
+    const skillDir = path.join(repoEntry.localPath, '.claude', 'skills', proposal.name);
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(path.join(skillDir, 'SKILL.md'), proposal.content, 'utf8');
+
+    const repoPath = repoEntry.localPath;
+    await execFileAsync('git', ['-C', repoPath, 'add', `.claude/skills/${proposal.name}/SKILL.md`]);
+    await execFileAsync('git', ['-C', repoPath, 'commit', '-m', `feat: skill 자동 생성 — ${proposal.name}`]);
+    await execFileAsync('git', ['-C', repoPath, 'push']);
+  }
+
+  // -------------------------------------------------------------------------
+  // Search command
+  // -------------------------------------------------------------------------
+
+  private async handleSearchCommand(query: string, msg: Message): Promise<void> {
+    if (!query) {
+      try { await msg.reply('사용법: `/search <검색어>`'); } catch { /* */ }
+      return;
+    }
+
+    let results: EventSearchResult[];
+    try {
+      results = searchEvents(this.db, query, 15);
+    } catch (err) {
+      log.error({ err: (err as Error).message, query }, 'search: query failed');
+      try { await msg.reply('검색 중 오류가 발생했습니다.'); } catch { /* */ }
+      return;
+    }
+
+    if (results.length === 0) {
+      try { await msg.reply(`"${query}"에 대한 결과 없음.`); } catch { /* */ }
+      return;
+    }
+
+    // Group by threadId (or channel if no thread)
+    const groups = new Map<string, EventSearchResult[]>();
+    for (const r of results) {
+      const key = r.threadId ?? r.channel ?? '(없음)';
+      const list = groups.get(key) ?? [];
+      list.push(r);
+      groups.set(key, list);
+    }
+
+    const lines: string[] = [`🔍 **"${query}"** — ${results.length}건\n`];
+    for (const [key, rows] of groups) {
+      const first = rows[0];
+      const ts = first.ts.slice(0, 16).replace('T', ' ');
+      const threadRef = first.threadId ? `<#${first.threadId}>` : (first.channel ?? key);
+      lines.push(`**[${ts}]** ${threadRef}`);
+      for (const r of rows.slice(0, 3)) {
+        const tag = r.type.replace('discord.', '').replace('claude.', '');
+        lines.push(`→ \`${tag}\`: ${r.snippet}`);
+      }
+      lines.push('');
+    }
+
+    const chunks = splitMessage(lines.join('\n'), SAFE_CHUNK_SIZE);
+    for (const chunk of chunks) {
+      try {
+        await msg.reply(chunk);
+      } catch (err) {
+        log.error({ err: (err as Error).message }, 'search: reply failed');
+        break;
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Mutex
   // -------------------------------------------------------------------------
 
@@ -1155,6 +1307,11 @@ export class DiscordAdapter implements MessengerAdapter {
     }
 
     const { text: visibleText } = extractRestartMarker(result.text);
+
+    // Parse skill proposals before stripping the block from display text.
+    const proposals = parseSkillProposals(visibleText);
+    const displayText = stripSkillProposalsBlock(visibleText);
+
     const repoShort = repoLabel.split('/').pop() ?? repoLabel;
     const dateStr = new Date().toISOString().slice(0, 10);
 
@@ -1166,7 +1323,7 @@ export class DiscordAdapter implements MessengerAdapter {
       if (clawChannel && clawChannel.isTextBased() && 'send' in clawChannel) {
         const clawSendable = clawChannel as unknown as TextSendable;
         const header = `**[자동 분석 리포트]** — \`${repoLabel}\` · 원본: <#${threadId}>\n\n`;
-        const chunks = splitMessage(header + visibleText, SAFE_CHUNK_SIZE);
+        const chunks = splitMessage(header + displayText, SAFE_CHUNK_SIZE);
         const firstMsg = await clawSendable.send(chunks[0] ?? '');
         const threadName = truncate(`[분석] ${repoShort} · ${dateStr}`, THREAD_NAME_MAX);
         const newThread = await firstMsg.startThread({
@@ -1179,6 +1336,44 @@ export class DiscordAdapter implements MessengerAdapter {
             await newThread.send(chunk);
           } catch (err) {
             log.error({ err: (err as Error).message }, 'analysis: claw thread chunk send failed');
+          }
+        }
+
+        // Add skill proposal buttons if any were detected.
+        if (proposals.length > 0) {
+          try {
+            const buttons = proposals.map((p) => {
+              const id = insertSkillProposal(this.db, {
+                kind: p.kind,
+                name: p.name,
+                description: p.description,
+                content: p.content,
+                repoFullName: p.repoFullName,
+                sourceThreadId: threadId,
+              });
+              const emoji = p.kind === 'claw' ? '✨' : '📦';
+              const label = truncate(
+                `${emoji} ${p.kind === 'claw' ? 'Claw' : 'Repo'} skill: ${p.name}`,
+                80,
+              );
+              return new ButtonBuilder()
+                .setCustomId(buildCreateSkillButtonId(id))
+                .setLabel(label)
+                .setStyle(ButtonStyle.Primary);
+            });
+
+            const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+            for (let i = 0; i < buttons.length; i += 5) {
+              rows.push(
+                new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons.slice(i, i + 5)),
+              );
+            }
+            await newThread.send({
+              content: 'Skill 후보 — 클릭하면 자동 생성됩니다:',
+              components: rows,
+            });
+          } catch (err) {
+            log.error({ err: (err as Error).message }, 'analysis: failed to post skill proposal buttons');
           }
         }
       }

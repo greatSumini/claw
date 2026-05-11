@@ -88,6 +88,68 @@ export function listEventsByThread(
   return stmt.all(threadId, limit).map(fromRow);
 }
 
+// ---------------------------------------------------------------------------
+// FTS5 full-text search
+// ---------------------------------------------------------------------------
+
+export interface EventSearchResult {
+  id: number;
+  ts: string;
+  type: string;
+  channel: string | null;
+  threadId: string | null;
+  summary: string;
+  snippet: string;
+}
+
+function sanitizeFts5Query(query: string): string {
+  const words = query.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return '""';
+  return words.map((w) => `"${w.replace(/"/g, '""')}"`).join(' ');
+}
+
+export function searchEvents(
+  db: Database.Database,
+  query: string,
+  limit = 15,
+): EventSearchResult[] {
+  if (!query || !query.trim()) return [];
+  if (!Number.isInteger(limit) || limit <= 0) {
+    throw new Error('searchEvents: limit must be a positive integer');
+  }
+  const safe = sanitizeFts5Query(query);
+  const stmt = db.prepare<
+    [string, number],
+    {
+      id: number;
+      ts: string;
+      type: string;
+      channel: string | null;
+      thread_id: string | null;
+      summary: string;
+      snippet: string;
+    }
+  >(
+    `SELECT e.id, e.ts, e.type, e.channel, e.thread_id, e.summary,
+            snippet(events_fts, 0, '**', '**', '…', 15) AS snippet
+     FROM events_fts
+     JOIN events e ON e.id = events_fts.rowid
+     WHERE events_fts MATCH ?
+     ORDER BY rank
+     LIMIT ?`,
+  );
+  const rows = stmt.all(safe, limit);
+  return rows.map((r) => ({
+    id: r.id,
+    ts: r.ts,
+    type: r.type,
+    channel: r.channel,
+    threadId: r.thread_id,
+    summary: r.summary,
+    snippet: r.snippet,
+  }));
+}
+
 export function countEventsByType(
   db: Database.Database,
   type: string,
