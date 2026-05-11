@@ -1,19 +1,12 @@
 import type Database from 'better-sqlite3';
 import { log } from '../log.js';
+import { STOPWORDS } from '../state/memories.js';
 
 const CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1시간마다 체크
 const DREAM_WINDOW_HOURS = 4; // 연속 4시간 저활동 구간
 const PROMOTE_THRESHOLD = 70; // 이 score 이상이면 Layer 2로 승격
 const ARCHIVE_THRESHOLD = 20; // Layer 2에서 이 score 미만이면 archived
 const DECAY_PER_DAY = 0.5; // 하루 비참조 시 score 감점
-
-// 불용어 (한/영 공통 단기어)
-const STOPWORDS = new Set([
-  'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-  'of', 'with', 'by', 'from', 'is', 'it', 'as', 'be', 'was', 'are',
-  '이', '그', '저', '을', '를', '이', '가', '은', '는', '에', '의',
-  '도', '로', '으로', '와', '과', '한', '하다', '하는', '있다', '없다',
-]);
 
 interface CandidateRow {
   id: number;
@@ -214,13 +207,14 @@ export class DreamingScheduler {
         id: number;
         score: number;
         status: string;
+        reference_count: number;
         last_referenced_at: string | null;
         updated_at: string;
       }
 
       const allMemories = this.db
         .prepare<[], MemoryRow>(
-          `SELECT id, score, status, last_referenced_at, updated_at
+          `SELECT id, score, status, reference_count, last_referenced_at, updated_at
            FROM memories
            WHERE status != 'archived'`,
         )
@@ -229,7 +223,9 @@ export class DreamingScheduler {
       for (const memory of allMemories) {
         const refBase = memory.last_referenced_at ?? memory.updated_at;
         const daysSinceRef = (Date.now() - new Date(refBase).getTime()) / 86400000;
-        const decay = daysSinceRef * DECAY_PER_DAY;
+        // GoClaw 벤치마크: 참조 많을수록 감쇠 완화 (ref=0: 1.0x, ref=5: 0.37x, ref=10: 0.29x)
+        const refBoost = 1 / (1 + Math.log1p(memory.reference_count));
+        const decay = daysSinceRef * DECAY_PER_DAY * refBoost;
         const newScore = Math.max(0, memory.score - decay);
 
         if (decay > 0) {
@@ -272,6 +268,13 @@ export class DreamingScheduler {
       // -----------------------------------------------------------------------
 
       log.info(stats, 'dreaming: completed');
+
+      // 승격된 memories 임베딩 (best-effort, 에러 시 무시)
+      if (stats.promoted > 0) {
+        import('../state/embeddings.js')
+          .then(({ embedPendingMemories }) => embedPendingMemories(this.db, stats.promoted + 2))
+          .catch((err: Error) => log.debug({ err: err.message }, 'dreaming: embed skip'));
+      }
 
       if (this.notify) {
         const lines = [

@@ -342,9 +342,23 @@ export function promoteCandidate(db: Database.Database, candidateId: number): nu
 // Keyword extraction
 // ---------------------------------------------------------------------------
 
-const STOPWORDS = new Set([
+export const STOPWORDS = new Set([
+  // 한국어 조사
   '이', '가', '을', '를', '은', '는', '에', '의', '와', '과', '도', '로', '으로',
-  'the', 'a', 'an', 'is', 'are', 'in', 'on', 'at', 'to', 'for',
+  '에서', '에게', '한테', '에는', '에도', '이라', '라고', '이라고',
+  '으로서', '로서', '처럼', '같이', '보다', '부터', '까지', '만', '마다',
+  // 한국어 어미·용언
+  '하다', '하는', '했다', '한다', '합니다', '했습니다',
+  '있다', '있는', '없다', '없는', '이다', '이며', '이고', '이지',
+  '됩니다', '된다', '되는', '되다',
+  // 지시사·대명사
+  '이것', '그것', '저것', '여기', '거기', '저기',
+  // 한국어 접속·부사
+  '그리고', '그런데', '그래서', '하지만', '또한', '또는', '그러나',
+  // 영어
+  'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+  'of', 'with', 'by', 'from', 'is', 'it', 'as', 'be', 'was', 'are',
+  'this', 'that', 'we', 'you', 'i', 'my', 'not', 'have', 'has',
 ]);
 
 function koreanBigrams(word: string): string[] {

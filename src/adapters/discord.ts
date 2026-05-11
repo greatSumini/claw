@@ -33,7 +33,6 @@ import {
   CLAW_RESTART_MARKER,
 } from '../orchestrator/prompt.js';
 import {
-  loadRelevantMemories,
   loadCandidateContext,
   saveMemory,
   extractKeywords,
@@ -46,6 +45,7 @@ import {
   repoScope,
   GLOBAL_SCOPE,
 } from '../state/memories.js';
+import { loadRelevantMemoriesHybrid } from '../state/memories-hybrid.js';
 import { detectSkill, truncateForCache } from '../orchestrator/skill-detector.js';
 import {
   buildConversationTranscript,
@@ -55,6 +55,7 @@ import {
   parseMemoryScores,
   stripMemoryScoresBlock,
 } from '../orchestrator/auto-analysis.js';
+import { extractAndSaveFacts } from '../orchestrator/fact-extractor.js';
 import {
   insertSkillProposal,
   getSkillProposal,
@@ -686,9 +687,9 @@ export class DiscordAdapter implements MessengerAdapter {
       const baseText = ctx.text + attachmentNote(savedPaths);
       const userMessage = threadContext ? `${threadContext}\n\n${baseText}` : baseText;
 
-      // Load relevant memories for context injection (Layer 2 + top Layer 1 candidates).
+      // Load relevant memories for context injection (Layer 2 hybrid + top Layer 1 candidates).
       const scopes = [channelScope(threadKey), repoScope(repo.fullName), GLOBAL_SCOPE];
-      const relevantMemories = loadRelevantMemories(this.db, scopes, ctx.text);
+      const relevantMemories = await loadRelevantMemoriesHybrid(this.db, scopes, ctx.text);
       const relevantCandidates = loadCandidateContext(this.db, scopes, ctx.text);
       const allMemories = [...relevantMemories, ...relevantCandidates];
 
@@ -814,6 +815,15 @@ export class DiscordAdapter implements MessengerAdapter {
         );
       }
 
+      // Fire-and-forget fact extraction (non-blocking, best-effort).
+      extractAndSaveFacts(
+        this.db,
+        this.config.clawRepoPath,
+        repoScope(repo.fullName),
+        ctx.text,
+        result.text,
+      ).catch((err: Error) => log.debug({ err: err.message }, 'fact-extractor: skipped'));
+
       // Result + outbound logs.
       logEvent(this.db, {
         type: 'claude.result',
@@ -923,9 +933,9 @@ export class DiscordAdapter implements MessengerAdapter {
       const baseText = ctx.text + attachmentNote(savedPaths);
       const userMessage = threadContext ? `${threadContext}\n\n${baseText}` : baseText;
 
-      // Load relevant memories for context injection (claw scope, Layer 2 + top Layer 1).
+      // Load relevant memories for context injection (claw scope, Layer 2 hybrid + top Layer 1).
       const clawScopes = [channelScope(threadKey), repoScope('greatSumini/claw'), GLOBAL_SCOPE];
-      const relevantMemoriesClaw = loadRelevantMemories(this.db, clawScopes, ctx.text);
+      const relevantMemoriesClaw = await loadRelevantMemoriesHybrid(this.db, clawScopes, ctx.text);
       const relevantCandidatesClaw = loadCandidateContext(this.db, clawScopes, ctx.text);
       const allMemoriesClaw = [...relevantMemoriesClaw, ...relevantCandidatesClaw];
 

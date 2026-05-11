@@ -220,6 +220,12 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_memory_refs_thread ON memory_references(thread_id);
     `,
   },
+  {
+    name: '009_memory_embeddings',
+    sql: `
+      ALTER TABLE memories ADD COLUMN embedding TEXT;
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {
