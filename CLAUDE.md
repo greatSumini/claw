@@ -76,3 +76,14 @@ triggers:
 2. frontmatter에 name, description, triggers 작성
 3. 본문에 주입할 실제 지침 내용 작성
 4. git commit & push (소스 변경 아니므로 `pnpm build` 불필요, 재시작 마커 불필요)
+
+### Skill 작성 검증 원칙
+
+**스크립트·외부 라이브러리가 포함된 skill은 실행 검증 전 SKILL.md 초안 작성 금지.**
+
+순서:
+1. 실제 환경에서 설치·실행 테스트
+2. 정확한 명령어·경로 확인
+3. 확인된 내용으로 SKILL.md 작성
+
+이유: 검증 전 선작성 시 설치 명령어·경로가 틀려 SKILL.md를 이중 수정하게 됨.
