@@ -14,11 +14,7 @@ import {
   type ButtonInteraction,
   type Channel,
   type Message,
-  type MessageReaction,
-  type PartialMessageReaction,
-  type PartialUser,
   type TextBasedChannel,
-  type User,
 } from 'discord.js';
 import type Database from 'better-sqlite3';
 
@@ -38,7 +34,8 @@ import {
 } from '../orchestrator/prompt.js';
 import {
   loadRelevantMemories,
-  saveCandidate,
+  saveMemory,
+  extractKeywords,
   recordMemoryReferences,
   getMemoriesForMessage,
   updateMemoryScore,
@@ -99,6 +96,29 @@ export function parseIgnoreSenderButtonId(
   const account = rest.slice(colonIdx + 1);
   if (!email || !account) return null;
   return { email, account };
+}
+
+const MEMORY_GOOD_PREFIX = 'memory-good';
+const MEMORY_BAD_PREFIX = 'memory-bad';
+
+export function buildMemoryGoodButtonId(refMsgId: string): string {
+  return `${MEMORY_GOOD_PREFIX}:${refMsgId}`;
+}
+
+export function buildMemoryBadButtonId(refMsgId: string): string {
+  return `${MEMORY_BAD_PREFIX}:${refMsgId}`;
+}
+
+export function parseMemoryFeedbackButtonId(
+  customId: string,
+): { kind: 'good' | 'bad'; refMsgId: string } | null {
+  if (customId.startsWith(`${MEMORY_GOOD_PREFIX}:`)) {
+    return { kind: 'good', refMsgId: customId.slice(MEMORY_GOOD_PREFIX.length + 1) };
+  }
+  if (customId.startsWith(`${MEMORY_BAD_PREFIX}:`)) {
+    return { kind: 'bad', refMsgId: customId.slice(MEMORY_BAD_PREFIX.length + 1) };
+  }
+  return null;
 }
 
 const CREATE_SKILL_PREFIX = 'create-skill';
@@ -289,9 +309,8 @@ export class DiscordAdapter implements MessengerAdapter {
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.DirectMessages,
-        GatewayIntentBits.GuildMessageReactions,
       ],
-      partials: [Partials.Channel, Partials.Message, Partials.Reaction],
+      partials: [Partials.Channel, Partials.Message],
     });
   }
 
@@ -322,14 +341,6 @@ export class DiscordAdapter implements MessengerAdapter {
       });
     });
 
-    this.client.on(Events.MessageReactionAdd, (reaction, user) => {
-      void this.onReactionAdd(
-        reaction as MessageReaction | PartialMessageReaction,
-        user as User | PartialUser,
-      ).catch((err) => {
-        log.error({ err: (err as Error).message }, 'discord reaction handler crashed');
-      });
-    });
 
     this.client.on(Events.ShardError, (err, shardId) => {
       log.error({ err: err.message, shardId }, 'discord shard error');
@@ -417,6 +428,13 @@ export class DiscordAdapter implements MessengerAdapter {
         content: `앞으로 **${email}** 발신자의 메일은 무시합니다.`,
         flags: 64,
       });
+      return;
+    }
+
+    // memory-good / memory-bad buttons
+    const memFeedback = parseMemoryFeedbackButtonId(interaction.customId);
+    if (memFeedback) {
+      await this.handleMemoryFeedbackButton(interaction, memFeedback.kind, memFeedback.refMsgId);
       return;
     }
 
@@ -785,7 +803,7 @@ export class DiscordAdapter implements MessengerAdapter {
         }
       }
 
-      // Track memory references and update reference stats.
+      // Track memory references and send feedback buttons.
       if (relevantMemories.length > 0) {
         try {
           markMemoriesReferenced(this.db, relevantMemories.map((m) => m.id));
@@ -795,6 +813,21 @@ export class DiscordAdapter implements MessengerAdapter {
               lastSentMessageId,
               relevantMemories.map((m) => ({ id: m.id, layer: 'memory' as const })),
             );
+            // Send discoverable feedback buttons
+            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder()
+                .setCustomId(buildMemoryGoodButtonId(lastSentMessageId))
+                .setLabel('👍 유용함')
+                .setStyle(ButtonStyle.Success),
+              new ButtonBuilder()
+                .setCustomId(buildMemoryBadButtonId(lastSentMessageId))
+                .setLabel('👎 틀린 정보')
+                .setStyle(ButtonStyle.Danger),
+            );
+            await target.channel.send({
+              content: `📎 *메모리 ${relevantMemories.length}개 참조됨 — 응답이 도움이 됐나요?*`,
+              components: [row],
+            });
           }
         } catch (err) {
           log.error({ err: (err as Error).message }, 'failed to record memory references');
@@ -1033,7 +1066,7 @@ export class DiscordAdapter implements MessengerAdapter {
         }
       }
 
-      // Track memory references.
+      // Track memory references and send feedback buttons (claw-maintenance).
       if (relevantMemoriesClaw.length > 0) {
         try {
           markMemoriesReferenced(this.db, relevantMemoriesClaw.map((m) => m.id));
@@ -1043,6 +1076,20 @@ export class DiscordAdapter implements MessengerAdapter {
               lastSentMsgIdClaw,
               relevantMemoriesClaw.map((m) => ({ id: m.id, layer: 'memory' as const })),
             );
+            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder()
+                .setCustomId(buildMemoryGoodButtonId(lastSentMsgIdClaw))
+                .setLabel('👍 유용함')
+                .setStyle(ButtonStyle.Success),
+              new ButtonBuilder()
+                .setCustomId(buildMemoryBadButtonId(lastSentMsgIdClaw))
+                .setLabel('👎 틀린 정보')
+                .setStyle(ButtonStyle.Danger),
+            );
+            await target.channel.send({
+              content: `📎 *메모리 ${relevantMemoriesClaw.length}개 참조됨 — 응답이 도움이 됐나요?*`,
+              components: [row],
+            });
           }
         } catch (err) {
           log.error({ err: (err as Error).message }, 'failed to record memory references (claw)');
@@ -1165,11 +1212,13 @@ export class DiscordAdapter implements MessengerAdapter {
       return;
     }
     try {
+      // 명시적 !기억 → Layer 2 직접 저장 (score 65, 즉시 주입 가능)
       const scope = ctx.threadId ? channelScope(ctx.threadId) : GLOBAL_SCOPE;
-      const key = value.slice(0, 80); // first 80 chars as key
-      saveCandidate(this.db, { scope, key, value });
-      await msg.reply(`📝 기억했습니다 (Layer 1, 7일 보관 후 승격/망각): \`${value.slice(0, 100)}\``);
-      log.info({ scope, key: key.slice(0, 40) }, 'memory candidate saved via !기억');
+      const key = value.slice(0, 80);
+      const tags = extractKeywords(value);
+      saveMemory(this.db, { scope, key, value, tags, score: 65, source: 'explicit' });
+      await msg.reply(`📝 기억했습니다 (Layer 2, 즉시 활성): \`${value.slice(0, 100)}\``);
+      log.info({ scope, key: key.slice(0, 40) }, 'memory saved to Layer 2 via !기억');
     } catch (err) {
       log.error({ err: (err as Error).message }, 'handleRememberCommand: failed');
       await msg.reply('❌ 저장 실패: ' + (err as Error).message);
@@ -1177,36 +1226,33 @@ export class DiscordAdapter implements MessengerAdapter {
   }
 
   // -------------------------------------------------------------------------
-  // Reaction handling (✅/❌ memory scoring)
+  // Memory feedback button handler
   // -------------------------------------------------------------------------
 
-  private async onReactionAdd(
-    reaction: MessageReaction | PartialMessageReaction,
-    user: User | PartialUser,
+  private async handleMemoryFeedbackButton(
+    interaction: ButtonInteraction,
+    kind: 'good' | 'bad',
+    refMsgId: string,
   ): Promise<void> {
-    const ownerId = this.config.env.DISCORD_OWNER_USER_ID;
-    if (user.id !== ownerId) return;
+    const refs = getMemoriesForMessage(this.db, refMsgId);
+    if (refs.length === 0) {
+      await interaction.reply({ content: '참조된 메모리를 찾을 수 없습니다.', flags: 64 });
+      return;
+    }
 
-    const emoji = reaction.emoji.name;
-    if (emoji !== '✅' && emoji !== '❌') return;
-
-    const messageId = reaction.message.id;
-    const refs = getMemoriesForMessage(this.db, messageId);
-    if (refs.length === 0) return;
-
-    const delta = emoji === '✅' ? 10 : -30;
-    const threadId = reaction.message.channelId;
-
+    const delta = kind === 'good' ? 10 : -30;
+    const threadId = interaction.channelId;
     for (const ref of refs) {
       if (ref.layer === 'memory') {
         updateMemoryScore(this.db, ref.memoryId, delta, threadId);
       }
     }
 
-    log.info(
-      { messageId, emoji, count: refs.length, delta },
-      'memory scores updated via reaction',
-    );
+    const label = kind === 'good'
+      ? `✅ 유용함 확인 (+10 × ${refs.length}개)`
+      : `❌ 오류 확인 (−30 × ${refs.length}개)`;
+    await interaction.reply({ content: label, flags: 64 });
+    log.info({ kind, refMsgId, count: refs.length, delta }, 'memory score updated via button');
   }
 
   // Skill creation (button handler)
