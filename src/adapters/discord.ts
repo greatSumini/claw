@@ -14,7 +14,11 @@ import {
   type ButtonInteraction,
   type Channel,
   type Message,
+  type MessageReaction,
+  type PartialMessageReaction,
+  type PartialUser,
   type TextBasedChannel,
+  type User,
 } from 'discord.js';
 import type Database from 'better-sqlite3';
 
@@ -32,6 +36,17 @@ import {
   buildAnalysisSystemAppend,
   CLAW_RESTART_MARKER,
 } from '../orchestrator/prompt.js';
+import {
+  loadRelevantMemories,
+  saveCandidate,
+  recordMemoryReferences,
+  getMemoriesForMessage,
+  updateMemoryScore,
+  markMemoriesReferenced,
+  channelScope,
+  repoScope,
+  GLOBAL_SCOPE,
+} from '../state/memories.js';
 import { detectSkill, truncateForCache } from '../orchestrator/skill-detector.js';
 import {
   buildConversationTranscript,
@@ -107,7 +122,7 @@ const SAFE_CHUNK_SIZE = 1900; // headroom for the [i/N]\n prefix
 const THREAD_NAME_MAX = 90; // Discord limit is 100; leave headroom
 const DEFAULT_AUTO_ARCHIVE_MIN = 1440;
 const TYPING_REFRESH_MS = 9_000;
-const CLAUDE_TIMEOUT_MS = 600_000;
+const CLAUDE_TIMEOUT_MS = 1_800_000; // 30 min
 
 // ---------------------------------------------------------------------------
 // Helpers (exported for shape testing)
@@ -274,8 +289,9 @@ export class DiscordAdapter implements MessengerAdapter {
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.DirectMessages,
+        GatewayIntentBits.GuildMessageReactions,
       ],
-      partials: [Partials.Channel, Partials.Message],
+      partials: [Partials.Channel, Partials.Message, Partials.Reaction],
     });
   }
 
@@ -303,6 +319,15 @@ export class DiscordAdapter implements MessengerAdapter {
           { err: (err as Error).message },
           'discord button interaction handler crashed',
         );
+      });
+    });
+
+    this.client.on(Events.MessageReactionAdd, (reaction, user) => {
+      void this.onReactionAdd(
+        reaction as MessageReaction | PartialMessageReaction,
+        user as User | PartialUser,
+      ).catch((err) => {
+        log.error({ err: (err as Error).message }, 'discord reaction handler crashed');
       });
     });
 
@@ -453,6 +478,13 @@ export class DiscordAdapter implements MessengerAdapter {
     if (ctx.text.startsWith('/search')) {
       const query = ctx.text.slice('/search'.length).trim();
       await this.handleSearchCommand(query, msg);
+      return;
+    }
+
+    // !기억 shortcut — save to memory Layer 1.
+    if (ctx.text.startsWith('!기억')) {
+      const value = ctx.text.slice('!기억'.length).trim();
+      await this.handleRememberCommand(value, msg, ctx);
       return;
     }
 
@@ -661,10 +693,16 @@ export class DiscordAdapter implements MessengerAdapter {
 
       const baseText = ctx.text + attachmentNote(savedPaths);
       const userMessage = threadContext ? `${threadContext}\n\n${baseText}` : baseText;
+
+      // Load relevant memories for context injection.
+      const scopes = [channelScope(threadKey), repoScope(repo.fullName), GLOBAL_SCOPE];
+      const relevantMemories = loadRelevantMemories(this.db, scopes, ctx.text);
+
       const baseSystemAppend = buildRepoWorkSystemAppend({
         userMessage,
         repo,
         isContinuation: Boolean(resumeId),
+        memories: relevantMemories,
       });
       const systemAppend = skillResult.content
         ? `# 활성 Skill: ${skillResult.skill}\n\n${skillResult.content}\n\n---\n${baseSystemAppend}`
@@ -674,8 +712,8 @@ export class DiscordAdapter implements MessengerAdapter {
         type: 'claude.invoke',
         channel: channelLabel,
         threadId: threadKey,
-        summary: `repo=${repo.fullName} resume=${Boolean(resumeId)}`,
-        meta: { repo: repo.fullName, resume: Boolean(resumeId) },
+        summary: `repo=${repo.fullName} resume=${Boolean(resumeId)} memories=${relevantMemories.length}`,
+        meta: { repo: repo.fullName, resume: Boolean(resumeId), memoryCount: relevantMemories.length },
       });
       emitEvent({
         ts: new Date().toISOString(),
@@ -726,17 +764,40 @@ export class DiscordAdapter implements MessengerAdapter {
         return;
       }
 
-      // Post the response.
+      // Post the response; capture last sent message ID for memory reference tracking.
       const chunks = splitMessage(result.text, SAFE_CHUNK_SIZE);
-      for (const chunk of chunks) {
+      let lastSentMessageId: string | null = null;
+      for (let i = 0; i < chunks.length; i++) {
+        const isLast = i === chunks.length - 1;
         try {
-          await safeSend(target.channel, chunk);
+          if (isLast && relevantMemories.length > 0) {
+            const sent = await safeSendWithId(target.channel, chunks[i]);
+            if (sent) lastSentMessageId = sent.id;
+          } else {
+            await safeSend(target.channel, chunks[i]);
+          }
         } catch (err) {
           log.error(
             { err: (err as Error).message, channel: channelLabel, threadId: threadKey },
             'failed to send response chunk',
           );
           break;
+        }
+      }
+
+      // Track memory references and update reference stats.
+      if (relevantMemories.length > 0) {
+        try {
+          markMemoriesReferenced(this.db, relevantMemories.map((m) => m.id));
+          if (lastSentMessageId) {
+            recordMemoryReferences(
+              this.db,
+              lastSentMessageId,
+              relevantMemories.map((m) => ({ id: m.id, layer: 'memory' as const })),
+            );
+          }
+        } catch (err) {
+          log.error({ err: (err as Error).message }, 'failed to record memory references');
         }
       }
 
@@ -865,8 +926,14 @@ export class DiscordAdapter implements MessengerAdapter {
 
       const baseText = ctx.text + attachmentNote(savedPaths);
       const userMessage = threadContext ? `${threadContext}\n\n${baseText}` : baseText;
+
+      // Load relevant memories for context injection (claw scope).
+      const clawScopes = [channelScope(threadKey), repoScope('greatSumini/claw'), GLOBAL_SCOPE];
+      const relevantMemoriesClaw = loadRelevantMemories(this.db, clawScopes, ctx.text);
+
       const baseSystemAppend = buildClawMaintenanceSystemAppend({
         isContinuation: Boolean(resumeId),
+        memories: relevantMemoriesClaw,
       });
       const systemAppend = skillResult.content
         ? `# 활성 Skill: ${skillResult.skill}\n\n${skillResult.content}\n\n---\n${baseSystemAppend}`
@@ -947,15 +1014,38 @@ export class DiscordAdapter implements MessengerAdapter {
       }
 
       const chunks = splitMessage(visibleText, SAFE_CHUNK_SIZE);
-      for (const chunk of chunks) {
+      let lastSentMsgIdClaw: string | null = null;
+      for (let i = 0; i < chunks.length; i++) {
+        const isLast = i === chunks.length - 1;
         try {
-          await safeSend(target.channel, chunk);
+          if (isLast && relevantMemoriesClaw.length > 0) {
+            const sent = await safeSendWithId(target.channel, chunks[i]);
+            if (sent) lastSentMsgIdClaw = sent.id;
+          } else {
+            await safeSend(target.channel, chunks[i]);
+          }
         } catch (err) {
           log.error(
             { err: (err as Error).message, channel: channelLabel, threadId: threadKey },
             'failed to send response chunk (claw-maintenance)',
           );
           break;
+        }
+      }
+
+      // Track memory references.
+      if (relevantMemoriesClaw.length > 0) {
+        try {
+          markMemoriesReferenced(this.db, relevantMemoriesClaw.map((m) => m.id));
+          if (lastSentMsgIdClaw) {
+            recordMemoryReferences(
+              this.db,
+              lastSentMsgIdClaw,
+              relevantMemoriesClaw.map((m) => ({ id: m.id, layer: 'memory' as const })),
+            );
+          }
+        } catch (err) {
+          log.error({ err: (err as Error).message }, 'failed to record memory references (claw)');
         }
       }
 
@@ -1061,6 +1151,64 @@ export class DiscordAdapter implements MessengerAdapter {
   }
 
   // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Memory commands
+  // -------------------------------------------------------------------------
+
+  private async handleRememberCommand(
+    value: string,
+    msg: Message,
+    ctx: MessageContext,
+  ): Promise<void> {
+    if (!value) {
+      await msg.reply('사용법: `!기억 <기억할 내용>`');
+      return;
+    }
+    try {
+      const scope = ctx.threadId ? channelScope(ctx.threadId) : GLOBAL_SCOPE;
+      const key = value.slice(0, 80); // first 80 chars as key
+      saveCandidate(this.db, { scope, key, value });
+      await msg.reply(`📝 기억했습니다 (Layer 1, 7일 보관 후 승격/망각): \`${value.slice(0, 100)}\``);
+      log.info({ scope, key: key.slice(0, 40) }, 'memory candidate saved via !기억');
+    } catch (err) {
+      log.error({ err: (err as Error).message }, 'handleRememberCommand: failed');
+      await msg.reply('❌ 저장 실패: ' + (err as Error).message);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Reaction handling (✅/❌ memory scoring)
+  // -------------------------------------------------------------------------
+
+  private async onReactionAdd(
+    reaction: MessageReaction | PartialMessageReaction,
+    user: User | PartialUser,
+  ): Promise<void> {
+    const ownerId = this.config.env.DISCORD_OWNER_USER_ID;
+    if (user.id !== ownerId) return;
+
+    const emoji = reaction.emoji.name;
+    if (emoji !== '✅' && emoji !== '❌') return;
+
+    const messageId = reaction.message.id;
+    const refs = getMemoriesForMessage(this.db, messageId);
+    if (refs.length === 0) return;
+
+    const delta = emoji === '✅' ? 10 : -30;
+    const threadId = reaction.message.channelId;
+
+    for (const ref of refs) {
+      if (ref.layer === 'memory') {
+        updateMemoryScore(this.db, ref.memoryId, delta, threadId);
+      }
+    }
+
+    log.info(
+      { messageId, emoji, count: refs.length, delta },
+      'memory scores updated via reaction',
+    );
+  }
+
   // Skill creation (button handler)
   // -------------------------------------------------------------------------
 
@@ -1608,6 +1756,16 @@ async function safeSend(channel: TextSendable, content: string): Promise<void> {
   // Discord rejects empty content, so substitute a single space if needed.
   const payload = content.length === 0 ? ' ' : content;
   await channel.send(payload);
+}
+
+/** Like safeSend but returns the sent Message (used when we need the message ID). */
+async function safeSendWithId(channel: TextSendable, content: string): Promise<Message | null> {
+  const payload = content.length === 0 ? ' ' : content;
+  try {
+    return await channel.send(payload);
+  } catch {
+    return null;
+  }
 }
 
 function stripLeadingMention(text: string, botUserId: string): string {

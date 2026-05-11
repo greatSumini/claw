@@ -127,6 +127,92 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    name: '007_memory_system',
+    sql: `
+      -- Layer 1: 단기 후보 (7일 TTL)
+      CREATE TABLE IF NOT EXISTS memories_candidate (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'general',
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        score REAL NOT NULL DEFAULT 50,
+        expires_at TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'explicit',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(scope, key)
+      );
+
+      -- Layer 1 관계 (그래프 엣지)
+      CREATE TABLE IF NOT EXISTS candidate_edges (
+        id_a INTEGER NOT NULL REFERENCES memories_candidate(id) ON DELETE CASCADE,
+        id_b INTEGER NOT NULL REFERENCES memories_candidate(id) ON DELETE CASCADE,
+        relation TEXT NOT NULL DEFAULT 'related',
+        PRIMARY KEY(id_a, id_b)
+      );
+
+      -- Layer 2: 장기 기억
+      CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'general',
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        tags TEXT NOT NULL DEFAULT '[]',
+        score REAL NOT NULL DEFAULT 50,
+        reference_count INTEGER NOT NULL DEFAULT 0,
+        last_referenced_at TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        promoted_from INTEGER,
+        source TEXT NOT NULL DEFAULT 'explicit',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(scope, key)
+      );
+
+      -- Layer 2 FTS
+      CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+        value, tags,
+        content='memories',
+        content_rowid='id',
+        tokenize='unicode61'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS memories_fts_ins AFTER INSERT ON memories BEGIN
+        INSERT INTO memories_fts(rowid, value, tags) VALUES (new.id, new.value, new.tags);
+      END;
+      CREATE TRIGGER IF NOT EXISTS memories_fts_upd AFTER UPDATE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, value, tags) VALUES ('delete', old.id, old.value, old.tags);
+        INSERT INTO memories_fts(rowid, value, tags) VALUES (new.id, new.value, new.tags);
+      END;
+      CREATE TRIGGER IF NOT EXISTS memories_fts_del AFTER DELETE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, value, tags) VALUES ('delete', old.id, old.value, old.tags);
+      END;
+
+      -- 점수 감사 로그 (Layer 1 + 2 통합)
+      CREATE TABLE IF NOT EXISTS memory_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id INTEGER,
+        layer TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        delta REAL NOT NULL DEFAULT 0,
+        thread_id TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      -- Discord 메시지 → 참조된 메모리 매핑 (✅/❌ 리액션 처리용)
+      CREATE TABLE IF NOT EXISTS memory_references (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        discord_message_id TEXT NOT NULL,
+        memory_id INTEGER NOT NULL,
+        layer TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_refs_msg ON memory_references(discord_message_id);
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

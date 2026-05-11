@@ -9,6 +9,7 @@ import { mountDashboard } from './dashboard/routes.js';
 import { DiscordAdapter } from './adapters/discord.js';
 import { GmailAdapter } from './adapters/gmail.js';
 import { RepoSyncScheduler } from './scheduler/repo-sync.js';
+import { DreamingScheduler } from './scheduler/dreaming.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -40,6 +41,12 @@ async function main(): Promise<void> {
   );
   repoSync.start();
 
+  // Dreaming: memory decay/promote during sleep hours, once per day
+  const dreaming = new DreamingScheduler(db, (msg) =>
+    discord.postToChannel(config.clawChannelId, msg),
+  );
+  dreaming.start();
+
   // Gmail (optional — only if configured)
   let gmail: GmailAdapter | null = null;
   const gmailReady = config.gmail.length > 0 && config.env.GMAIL_CLIENT_ID && config.env.GMAIL_CLIENT_SECRET;
@@ -63,6 +70,7 @@ async function main(): Promise<void> {
     try {
       server.close();
       repoSync.stop();
+      dreaming.stop();
       await discord.stop();
       if (gmail) await gmail.stop();
       closeDb();

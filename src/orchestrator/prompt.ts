@@ -1,10 +1,20 @@
 import type { RepoEntry } from '../config.js';
+import type { Memory } from '../state/memories.js';
 
 export interface RepoWorkPromptArgs {
   userMessage: string;
   repo: RepoEntry;
   /** If true, this is a follow-up turn in an existing thread; tone is slightly less formal. */
   isContinuation: boolean;
+  /** Memories to inject before the 지시 block. */
+  memories?: Memory[];
+}
+
+/** Format an array of memories into a system-prompt block. Returns '' if empty. */
+export function formatMemoryBlock(memories: Memory[]): string {
+  if (!memories || memories.length === 0) return '';
+  const lines = memories.map((m) => `- [${m.type}] ${m.value}`);
+  return `# 저장된 컨텍스트\n${lines.join('\n')}\n\n---\n`;
 }
 
 const BASE_LINES = [
@@ -29,7 +39,9 @@ const LIFE_OS_HINT =
  *  - life-os specific skill hint
  */
 export function buildRepoWorkSystemAppend(args: RepoWorkPromptArgs): string {
+  const memBlock = formatMemoryBlock(args.memories ?? []);
   const lines: string[] = [];
+  if (memBlock) lines.push(memBlock);
   lines.push('지시:');
   for (const line of BASE_LINES) {
     lines.push(`- ${line}`);
@@ -61,6 +73,8 @@ export function buildAnalysisSystemAppend(): string {
 
 export interface ClawMaintenancePromptArgs {
   isContinuation: boolean;
+  /** Memories to inject before the 지시 block. */
+  memories?: Memory[];
 }
 
 /** 재실행 트리거 마커. claw가 응답에서 이 라인을 검출하면 본문에서 제거 후 launchctl kickstart 수행. */
@@ -76,7 +90,9 @@ export const CLAW_RESTART_MARKER = '__CLAW_RESTART__';
 export function buildClawMaintenanceSystemAppend(
   args: ClawMaintenancePromptArgs,
 ): string {
+  const memBlock = formatMemoryBlock(args.memories ?? []);
   const lines: string[] = [];
+  if (memBlock) lines.push(memBlock);
   lines.push('지시:');
   lines.push('- 한국어로 응답');
   lines.push(
