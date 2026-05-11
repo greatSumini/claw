@@ -4,7 +4,6 @@ import { log } from '../log.js';
 const CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1시간마다 체크
 const DREAM_WINDOW_HOURS = 4; // 연속 4시간 저활동 구간
 const PROMOTE_THRESHOLD = 70; // 이 score 이상이면 Layer 2로 승격
-const SURVIVE_THRESHOLD = 40; // TTL 지난 후 이 score 미만이면 망각
 const ARCHIVE_THRESHOLD = 20; // Layer 2에서 이 score 미만이면 archived
 const DECAY_PER_DAY = 0.5; // 하루 비참조 시 score 감점
 
@@ -183,8 +182,8 @@ export class DreamingScheduler {
             // 만료됐지만 score 높음 → 승격
             this.promoteCandidate({ ...candidate, score: newScore });
             stats.promoted++;
-          } else if (newScore < SURVIVE_THRESHOLD) {
-            // 만료 + score 낮음 → 망각
+          } else {
+            // 만료 + 승격 기준 미달 → 무조건 망각 (zombie 방지)
             this.db
               .prepare<[number]>(`DELETE FROM memories_candidate WHERE id = ?`)
               .run(candidate.id);
@@ -198,7 +197,6 @@ export class DreamingScheduler {
 
             stats.forgotten++;
           }
-          // SURVIVE_THRESHOLD <= score < PROMOTE_THRESHOLD && 만료: 아무것도 안 함 (추가 TTL 연장 없이 유지)
         } else {
           // 아직 만료 안된 것 중 score 높으면 조기 승격
           if (newScore >= PROMOTE_THRESHOLD) {

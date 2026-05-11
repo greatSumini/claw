@@ -347,13 +347,26 @@ const STOPWORDS = new Set([
   'the', 'a', 'an', 'is', 'are', 'in', 'on', 'at', 'to', 'for',
 ]);
 
+function koreanBigrams(word: string): string[] {
+  if (word.length < 2) return [];
+  const result: string[] = [];
+  for (let i = 0; i < word.length - 1; i++) {
+    result.push(word.slice(i, i + 2));
+  }
+  return result;
+}
+
 export function extractKeywords(text: string): string[] {
   const words = text
     .split(/[\s\p{P}]+/u)
     .map((w) => w.toLowerCase())
     .filter((w) => w.length >= 2 && !STOPWORDS.has(w));
 
-  return [...new Set(words)];
+  const bigrams = words
+    .filter((w) => /[가-힣]/.test(w) && w.length >= 3)
+    .flatMap(koreanBigrams);
+
+  return [...new Set([...words, ...bigrams])];
 }
 
 // ---------------------------------------------------------------------------
