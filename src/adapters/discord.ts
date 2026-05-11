@@ -65,6 +65,7 @@ import {
 import type { MessageContext } from '../messenger/types.js';
 import type { MessengerAdapter } from '../messenger/types.js';
 import { downloadAttachments, attachmentNote } from '../attachments.js';
+import { type Artifact } from '../artifact.js';
 import { setSenderPolicy } from '../state/mail.js';
 import {
   upsertSessionAnalysis,
@@ -780,6 +781,9 @@ export class DiscordAdapter implements MessengerAdapter {
         }
       }
 
+      // Send artifact attachments/links after text.
+      await sendArtifacts(target.channel, result.artifacts, channelLabel, threadKey);
+
       // Track memory references for auto-analysis scoring later.
       if (allMemories.length > 0 && lastSentMessageId) {
         try {
@@ -1040,6 +1044,9 @@ export class DiscordAdapter implements MessengerAdapter {
           break;
         }
       }
+
+      // Send artifact attachments/links after text.
+      await sendArtifacts(target.channel, result.artifacts, channelLabel, threadKey);
 
       // Track memory references and send feedback buttons (claw-maintenance).
       // Track memory references for auto-analysis scoring later.
@@ -1773,6 +1780,38 @@ function stripLeadingMention(text: string, botUserId: string): string {
   // Strip one or more leading mentions of the bot (with or without `!`).
   const re = new RegExp(`^(?:<@!?${botUserId}>\\s*)+`);
   return text.replace(re, '').trim();
+}
+
+/**
+ * Send artifact attachments and URL links to a Discord channel.
+ * Errors are logged as warnings and do not interrupt the caller.
+ */
+async function sendArtifacts(
+  channel: TextSendable,
+  artifacts: Artifact[],
+  channelLabel: string,
+  threadKey: string,
+): Promise<void> {
+  for (const artifact of artifacts) {
+    try {
+      if (artifact.kind === 'file' && artifact.path) {
+        const attachment = new AttachmentBuilder(artifact.path, {
+          name: path.basename(artifact.path),
+        });
+        await channel.send({ content: artifact.caption ?? '', files: [attachment] });
+      } else if (artifact.kind === 'url' && artifact.url) {
+        const content = artifact.caption
+          ? `${artifact.caption}\n${artifact.url}`
+          : artifact.url;
+        await safeSend(channel, content);
+      }
+    } catch (err) {
+      log.warn(
+        { err: (err as Error).message, artifact, channel: channelLabel, threadId: threadKey },
+        'failed to send artifact',
+      );
+    }
+  }
 }
 
 /**

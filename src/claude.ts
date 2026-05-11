@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { type Artifact, extractArtifacts } from './artifact.js';
 import { log } from './log.js';
 
 export interface ClaudeRunOptions {
@@ -30,6 +31,8 @@ export interface ClaudeRunResult {
   durationMs: number;
   /** claude process exit code (0 on success). */
   exitCode: number;
+  /** Parsed artifact markers stripped from text (files to attach, URLs to link). */
+  artifacts: Artifact[];
 }
 
 export class ClaudeError extends Error {
@@ -403,8 +406,8 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
                 stderrBuf,
               );
             }
-            const text = acc.resultText || acc.assistantTextFallback;
-            if (!text) {
+            const rawText = acc.resultText || acc.assistantTextFallback;
+            if (!rawText) {
               throw new ClaudeError(
                 'claude run produced no assistant text',
                 exitCode,
@@ -415,7 +418,8 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
               // Fall back to filesystem lookup.
               acc.sessionId = await lookupLatestSessionId(opts.cwd);
             }
-            return { text, sessionId: acc.sessionId, durationMs, exitCode };
+            const { text, artifacts } = extractArtifacts(rawText);
+            return { text, sessionId: acc.sessionId, durationMs, exitCode, artifacts };
           }
           if (caps.outputMode === 'json') {
             const obj = tryParseJson(stdoutTextBuf) ?? {};
@@ -427,8 +431,8 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
                 stderrBuf,
               );
             }
-            const text = typeof obj.result === 'string' ? obj.result : '';
-            if (!text) {
+            const rawText = typeof obj.result === 'string' ? obj.result : '';
+            if (!rawText) {
               throw new ClaudeError(
                 'claude json output had no result field',
                 exitCode,
@@ -436,11 +440,12 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
               );
             }
             const sessionId = obj.session_id || (await lookupLatestSessionId(opts.cwd));
-            return { text, sessionId, durationMs, exitCode };
+            const { text, artifacts } = extractArtifacts(rawText);
+            return { text, sessionId, durationMs, exitCode, artifacts };
           }
           // text mode
-          const text = stdoutTextBuf.trim();
-          if (!text) {
+          const rawText = stdoutTextBuf.trim();
+          if (!rawText) {
             throw new ClaudeError(
               'claude text output was empty',
               exitCode,
@@ -448,7 +453,8 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
             );
           }
           const sessionId = await lookupLatestSessionId(opts.cwd);
-          return { text, sessionId, durationMs, exitCode };
+          const { text, artifacts } = extractArtifacts(rawText);
+          return { text, sessionId, durationMs, exitCode, artifacts };
         };
 
         finalize().then(

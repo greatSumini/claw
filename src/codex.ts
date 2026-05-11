@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { type Artifact, extractArtifacts } from './artifact.js';
 import { log } from './log.js';
 
 export interface CodexRunOptions {
@@ -30,6 +31,8 @@ export interface CodexRunResult {
   durationMs: number;
   /** codex process exit code (0 on success). */
   exitCode: number;
+  /** Parsed artifact markers stripped from text (files to attach, URLs to link). */
+  artifacts: Artifact[];
 }
 
 export class CodexError extends Error {
@@ -288,7 +291,8 @@ export function runCodex(opts: CodexRunOptions): Promise<CodexRunResult> {
             throw new CodexError('codex run produced no assistant text', exitCode, stderrBuf);
           }
           const sessionId = acc.sessionId || (await lookupLatestCodexSessionId());
-          return { text: acc.text, sessionId, durationMs, exitCode };
+          const { text, artifacts } = extractArtifacts(acc.text);
+          return { text, sessionId, durationMs, exitCode, artifacts };
         };
 
         finalize().then(

@@ -22,6 +22,11 @@ export function formatMemoryBlock(memories: MemoryLike[]): string {
   return `# 저장된 컨텍스트\n${lines.join('\n')}\n\n---\n`;
 }
 
+export const ARTIFACT_INSTRUCTION =
+  '파일(PDF, HTML 등)이나 URL을 산출물로 생성했을 경우 응답 끝에 다음 형식으로 표시 (claw가 해당 파일/링크를 Discord에 직접 첨부):\n' +
+  '  `__CLAW_ARTIFACT__ {"kind":"file","path":"/절대경로","caption":"설명"}`\n' +
+  '  `__CLAW_ARTIFACT__ {"kind":"url","url":"https://...","caption":"설명"}`';
+
 const BASE_LINES = [
   '한국어로 응답',
   '작업 끝나면 의미 단위로 git commit & push까지 완수. 첫 push 시 `gh auth setup-git` 먼저 (idempotent, GH_TOKEN 자동 인식). 실패 시 강행 금지(-f X), 보고만.',
@@ -29,6 +34,7 @@ const BASE_LINES = [
   '디스커버리 콜·미팅 초대·인터뷰 등 일정을 잡는 이메일 발송 완료 후에는 반드시 "통화/미팅 시간 확정 시 캘린더 일정도 바로 만들어드릴 수 있습니다"를 안내.',
   '이메일 초안 제시 후에는 마지막 줄에 "발송할까요? (ㄱㄱ / 수정 요청)" 한 줄을 반드시 포함.',
   '문서 출력물 포맷 선택 기준: 디자인 자유도가 필요한 산출물(견적서·계약서·보고서·인보이스)은 HTML 우선, 단순 텍스트 변환은 Markdown 우선. 사용자가 명시하지 않아도 이 기준으로 먼저 판단·제안.',
+  ARTIFACT_INSTRUCTION,
 ];
 
 const LIFE_OS_HINT =
@@ -116,6 +122,7 @@ export function buildClawMaintenanceSystemAppend(
   lines.push(
     '- 완료 메시지 끝에 재시작 여부를 반드시 명시: "재시작: 트리거됨" 또는 "재시작: 불필요 (문서/테스트만 변경)"',
   );
+  lines.push(`- ${ARTIFACT_INSTRUCTION}`);
   if (args.isContinuation) {
     lines.push('- (이전 대화 이어가기 모드 — 같은 thread 안에서의 후속 메시지)');
   }
