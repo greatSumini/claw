@@ -34,12 +34,14 @@ import {
 } from '../orchestrator/prompt.js';
 import {
   loadRelevantMemories,
+  loadCandidateContext,
   saveMemory,
   extractKeywords,
   recordMemoryReferences,
-  getMemoriesForMessage,
   updateMemoryScore,
+  updateCandidateScore,
   markMemoriesReferenced,
+  getMemoriesForThread,
   channelScope,
   repoScope,
   GLOBAL_SCOPE,
@@ -50,6 +52,8 @@ import {
   buildAnalysisPrompt,
   parseSkillProposals,
   stripSkillProposalsBlock,
+  parseMemoryScores,
+  stripMemoryScoresBlock,
 } from '../orchestrator/auto-analysis.js';
 import {
   insertSkillProposal,
@@ -96,29 +100,6 @@ export function parseIgnoreSenderButtonId(
   const account = rest.slice(colonIdx + 1);
   if (!email || !account) return null;
   return { email, account };
-}
-
-const MEMORY_GOOD_PREFIX = 'memory-good';
-const MEMORY_BAD_PREFIX = 'memory-bad';
-
-export function buildMemoryGoodButtonId(refMsgId: string): string {
-  return `${MEMORY_GOOD_PREFIX}:${refMsgId}`;
-}
-
-export function buildMemoryBadButtonId(refMsgId: string): string {
-  return `${MEMORY_BAD_PREFIX}:${refMsgId}`;
-}
-
-export function parseMemoryFeedbackButtonId(
-  customId: string,
-): { kind: 'good' | 'bad'; refMsgId: string } | null {
-  if (customId.startsWith(`${MEMORY_GOOD_PREFIX}:`)) {
-    return { kind: 'good', refMsgId: customId.slice(MEMORY_GOOD_PREFIX.length + 1) };
-  }
-  if (customId.startsWith(`${MEMORY_BAD_PREFIX}:`)) {
-    return { kind: 'bad', refMsgId: customId.slice(MEMORY_BAD_PREFIX.length + 1) };
-  }
-  return null;
 }
 
 const CREATE_SKILL_PREFIX = 'create-skill';
@@ -431,13 +412,6 @@ export class DiscordAdapter implements MessengerAdapter {
       return;
     }
 
-    // memory-good / memory-bad buttons
-    const memFeedback = parseMemoryFeedbackButtonId(interaction.customId);
-    if (memFeedback) {
-      await this.handleMemoryFeedbackButton(interaction, memFeedback.kind, memFeedback.refMsgId);
-      return;
-    }
-
     // create-skill button
     const proposalId = parseCreateSkillButtonId(interaction.customId);
     if (proposalId !== null) {
@@ -712,15 +686,17 @@ export class DiscordAdapter implements MessengerAdapter {
       const baseText = ctx.text + attachmentNote(savedPaths);
       const userMessage = threadContext ? `${threadContext}\n\n${baseText}` : baseText;
 
-      // Load relevant memories for context injection.
+      // Load relevant memories for context injection (Layer 2 + top Layer 1 candidates).
       const scopes = [channelScope(threadKey), repoScope(repo.fullName), GLOBAL_SCOPE];
       const relevantMemories = loadRelevantMemories(this.db, scopes, ctx.text);
+      const relevantCandidates = loadCandidateContext(this.db, scopes, ctx.text);
+      const allMemories = [...relevantMemories, ...relevantCandidates];
 
       const baseSystemAppend = buildRepoWorkSystemAppend({
         userMessage,
         repo,
         isContinuation: Boolean(resumeId),
-        memories: relevantMemories,
+        memories: allMemories,
       });
       const systemAppend = skillResult.content
         ? `# 활성 Skill: ${skillResult.skill}\n\n${skillResult.content}\n\n---\n${baseSystemAppend}`
@@ -730,8 +706,8 @@ export class DiscordAdapter implements MessengerAdapter {
         type: 'claude.invoke',
         channel: channelLabel,
         threadId: threadKey,
-        summary: `repo=${repo.fullName} resume=${Boolean(resumeId)} memories=${relevantMemories.length}`,
-        meta: { repo: repo.fullName, resume: Boolean(resumeId), memoryCount: relevantMemories.length },
+        summary: `repo=${repo.fullName} resume=${Boolean(resumeId)} memories=${allMemories.length}`,
+        meta: { repo: repo.fullName, resume: Boolean(resumeId), memoryCount: allMemories.length },
       });
       emitEvent({
         ts: new Date().toISOString(),
@@ -803,32 +779,19 @@ export class DiscordAdapter implements MessengerAdapter {
         }
       }
 
-      // Track memory references and send feedback buttons.
-      if (relevantMemories.length > 0) {
+      // Track memory references for auto-analysis scoring later.
+      if (allMemories.length > 0 && lastSentMessageId) {
         try {
           markMemoriesReferenced(this.db, relevantMemories.map((m) => m.id));
-          if (lastSentMessageId) {
-            recordMemoryReferences(
-              this.db,
-              lastSentMessageId,
-              relevantMemories.map((m) => ({ id: m.id, layer: 'memory' as const })),
-            );
-            // Send discoverable feedback buttons
-            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-              new ButtonBuilder()
-                .setCustomId(buildMemoryGoodButtonId(lastSentMessageId))
-                .setLabel('👍 유용함')
-                .setStyle(ButtonStyle.Success),
-              new ButtonBuilder()
-                .setCustomId(buildMemoryBadButtonId(lastSentMessageId))
-                .setLabel('👎 틀린 정보')
-                .setStyle(ButtonStyle.Danger),
-            );
-            await target.channel.send({
-              content: `📎 *메모리 ${relevantMemories.length}개 참조됨 — 응답이 도움이 됐나요?*`,
-              components: [row],
-            });
-          }
+          recordMemoryReferences(
+            this.db,
+            lastSentMessageId,
+            [
+              ...relevantMemories.map((m) => ({ id: m.id, layer: 'memory' as const })),
+              ...relevantCandidates.map((c) => ({ id: c.id, layer: 'candidate' as const })),
+            ],
+            threadKey,
+          );
         } catch (err) {
           log.error({ err: (err as Error).message }, 'failed to record memory references');
         }
@@ -960,13 +923,15 @@ export class DiscordAdapter implements MessengerAdapter {
       const baseText = ctx.text + attachmentNote(savedPaths);
       const userMessage = threadContext ? `${threadContext}\n\n${baseText}` : baseText;
 
-      // Load relevant memories for context injection (claw scope).
+      // Load relevant memories for context injection (claw scope, Layer 2 + top Layer 1).
       const clawScopes = [channelScope(threadKey), repoScope('greatSumini/claw'), GLOBAL_SCOPE];
       const relevantMemoriesClaw = loadRelevantMemories(this.db, clawScopes, ctx.text);
+      const relevantCandidatesClaw = loadCandidateContext(this.db, clawScopes, ctx.text);
+      const allMemoriesClaw = [...relevantMemoriesClaw, ...relevantCandidatesClaw];
 
       const baseSystemAppend = buildClawMaintenanceSystemAppend({
         isContinuation: Boolean(resumeId),
-        memories: relevantMemoriesClaw,
+        memories: allMemoriesClaw,
       });
       const systemAppend = skillResult.content
         ? `# 활성 Skill: ${skillResult.skill}\n\n${skillResult.content}\n\n---\n${baseSystemAppend}`
@@ -1067,30 +1032,19 @@ export class DiscordAdapter implements MessengerAdapter {
       }
 
       // Track memory references and send feedback buttons (claw-maintenance).
-      if (relevantMemoriesClaw.length > 0) {
+      // Track memory references for auto-analysis scoring later.
+      if (allMemoriesClaw.length > 0 && lastSentMsgIdClaw) {
         try {
           markMemoriesReferenced(this.db, relevantMemoriesClaw.map((m) => m.id));
-          if (lastSentMsgIdClaw) {
-            recordMemoryReferences(
-              this.db,
-              lastSentMsgIdClaw,
-              relevantMemoriesClaw.map((m) => ({ id: m.id, layer: 'memory' as const })),
-            );
-            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-              new ButtonBuilder()
-                .setCustomId(buildMemoryGoodButtonId(lastSentMsgIdClaw))
-                .setLabel('👍 유용함')
-                .setStyle(ButtonStyle.Success),
-              new ButtonBuilder()
-                .setCustomId(buildMemoryBadButtonId(lastSentMsgIdClaw))
-                .setLabel('👎 틀린 정보')
-                .setStyle(ButtonStyle.Danger),
-            );
-            await target.channel.send({
-              content: `📎 *메모리 ${relevantMemoriesClaw.length}개 참조됨 — 응답이 도움이 됐나요?*`,
-              components: [row],
-            });
-          }
+          recordMemoryReferences(
+            this.db,
+            lastSentMsgIdClaw,
+            [
+              ...relevantMemoriesClaw.map((m) => ({ id: m.id, layer: 'memory' as const })),
+              ...relevantCandidatesClaw.map((c) => ({ id: c.id, layer: 'candidate' as const })),
+            ],
+            threadKey,
+          );
         } catch (err) {
           log.error({ err: (err as Error).message }, 'failed to record memory references (claw)');
         }
@@ -1223,36 +1177,6 @@ export class DiscordAdapter implements MessengerAdapter {
       log.error({ err: (err as Error).message }, 'handleRememberCommand: failed');
       await msg.reply('❌ 저장 실패: ' + (err as Error).message);
     }
-  }
-
-  // -------------------------------------------------------------------------
-  // Memory feedback button handler
-  // -------------------------------------------------------------------------
-
-  private async handleMemoryFeedbackButton(
-    interaction: ButtonInteraction,
-    kind: 'good' | 'bad',
-    refMsgId: string,
-  ): Promise<void> {
-    const refs = getMemoriesForMessage(this.db, refMsgId);
-    if (refs.length === 0) {
-      await interaction.reply({ content: '참조된 메모리를 찾을 수 없습니다.', flags: 64 });
-      return;
-    }
-
-    const delta = kind === 'good' ? 10 : -30;
-    const threadId = interaction.channelId;
-    for (const ref of refs) {
-      if (ref.layer === 'memory') {
-        updateMemoryScore(this.db, ref.memoryId, delta, threadId);
-      }
-    }
-
-    const label = kind === 'good'
-      ? `✅ 유용함 확인 (+10 × ${refs.length}개)`
-      : `❌ 오류 확인 (−30 × ${refs.length}개)`;
-    await interaction.reply({ content: label, flags: 64 });
-    log.info({ kind, refMsgId, count: refs.length, delta }, 'memory score updated via button');
   }
 
   // Skill creation (button handler)
@@ -1484,7 +1408,8 @@ export class DiscordAdapter implements MessengerAdapter {
     log.info({ threadId, userMsgCount, repo: repoLabel }, 'analysis: starting');
 
     const transcript = buildConversationTranscript(this.db, threadId);
-    const prompt = buildAnalysisPrompt(threadId, transcript, repoLabel);
+    const injectedMemories = getMemoriesForThread(this.db, threadId);
+    const prompt = buildAnalysisPrompt(threadId, transcript, repoLabel, injectedMemories);
     const systemAppend = buildAnalysisSystemAppend();
 
     let result;
@@ -1502,9 +1427,27 @@ export class DiscordAdapter implements MessengerAdapter {
 
     const { text: visibleText } = extractRestartMarker(result.text);
 
-    // Parse skill proposals before stripping the block from display text.
+    // Apply memory scores from analysis before stripping blocks.
+    const memoryScores = parseMemoryScores(visibleText);
+    for (const { id, layer, delta } of memoryScores) {
+      if (delta === 0) continue;
+      try {
+        if (layer === 'memory') {
+          updateMemoryScore(this.db, id, delta, threadId);
+        } else {
+          updateCandidateScore(this.db, id, delta, threadId);
+        }
+      } catch (err) {
+        log.warn({ err: (err as Error).message, id, layer, delta }, 'analysis: failed to apply memory score');
+      }
+    }
+    if (memoryScores.length > 0) {
+      log.info({ threadId, count: memoryScores.length }, 'analysis: memory scores applied');
+    }
+
+    // Parse skill proposals before stripping blocks from display text.
     const proposals = parseSkillProposals(visibleText);
-    const displayText = stripSkillProposalsBlock(visibleText);
+    const displayText = stripSkillProposalsBlock(stripMemoryScoresBlock(visibleText));
 
     const repoShort = repoLabel.split('/').pop() ?? repoLabel;
     const dateStr = new Date().toISOString().slice(0, 10);

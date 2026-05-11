@@ -417,6 +417,47 @@ export function loadRelevantMemories(
 }
 
 // ---------------------------------------------------------------------------
+// Layer 1 relevance loading (for context injection)
+// ---------------------------------------------------------------------------
+
+export function loadCandidateContext(
+  db: Database.Database,
+  scopes: string[],
+  message: string,
+  maxCount = 2,
+): MemoryCandidate[] {
+  if (scopes.length === 0) return [];
+
+  const placeholders = scopes.map(() => '?').join(', ');
+  const rows = db
+    .prepare<string[], CandidateDbRow>(
+      `SELECT id, scope, type, key, value, score, expires_at, source, created_at, updated_at
+       FROM memories_candidate
+       WHERE scope IN (${placeholders})
+       ORDER BY score DESC
+       LIMIT 20`,
+    )
+    .all(...scopes);
+
+  const candidates = rows.map(candidateFromRow);
+  const keywords = extractKeywords(message);
+
+  if (keywords.length === 0) return candidates.slice(0, maxCount);
+
+  const scored = candidates.map((c) => {
+    const searchText = [c.key, c.value].join(' ').toLowerCase();
+    const relevance = keywords.filter((kw) => searchText.includes(kw)).length;
+    return { c, relevance };
+  });
+
+  return scored
+    .filter((s) => s.relevance > 0)
+    .sort((a, b) => b.relevance - a.relevance || b.c.score - a.c.score)
+    .slice(0, maxCount)
+    .map((s) => s.c);
+}
+
+// ---------------------------------------------------------------------------
 // Discord message ↔ memory references
 // ---------------------------------------------------------------------------
 
@@ -424,20 +465,54 @@ export function recordMemoryReferences(
   db: Database.Database,
   discordMessageId: string,
   memoryIds: Array<{ id: number; layer: 'candidate' | 'memory' }>,
+  threadId?: string,
 ): void {
   const now = new Date().toISOString();
   const stmt = db.prepare(
-    `INSERT INTO memory_references (discord_message_id, memory_id, layer, created_at)
-     VALUES (@discordMessageId, @memoryId, @layer, @now)`,
+    `INSERT INTO memory_references (discord_message_id, memory_id, layer, thread_id, created_at)
+     VALUES (@discordMessageId, @memoryId, @layer, @threadId, @now)`,
   );
 
   const insertAll = db.transaction(() => {
     for (const { id, layer } of memoryIds) {
-      stmt.run({ discordMessageId, memoryId: id, layer, now });
+      stmt.run({ discordMessageId, memoryId: id, layer, threadId: threadId ?? null, now });
     }
   });
 
   insertAll();
+}
+
+export interface ThreadMemoryRef {
+  id: number;
+  layer: 'candidate' | 'memory';
+  key: string;
+  value: string;
+  type: string;
+}
+
+export function getMemoriesForThread(
+  db: Database.Database,
+  threadId: string,
+): ThreadMemoryRef[] {
+  const layer2 = db
+    .prepare<[string], ThreadMemoryRef>(
+      `SELECT DISTINCT mr.memory_id AS id, 'memory' AS layer, m.key, m.value, m.type
+       FROM memory_references mr
+       JOIN memories m ON m.id = mr.memory_id
+       WHERE mr.thread_id = ?`,
+    )
+    .all(threadId);
+
+  const layer1 = db
+    .prepare<[string], ThreadMemoryRef>(
+      `SELECT DISTINCT mr.memory_id AS id, 'candidate' AS layer, mc.key, mc.value, mc.type
+       FROM memory_references mr
+       JOIN memories_candidate mc ON mc.id = mr.memory_id
+       WHERE mr.thread_id = ?`,
+    )
+    .all(threadId);
+
+  return [...layer2, ...layer1];
 }
 
 /** Increment reference_count and update last_referenced_at for Layer 2 memories that were injected. */

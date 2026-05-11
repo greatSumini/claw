@@ -213,6 +213,13 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_memory_refs_msg ON memory_references(discord_message_id);
     `,
   },
+  {
+    name: '008_memory_references_thread_id',
+    sql: `
+      ALTER TABLE memory_references ADD COLUMN thread_id TEXT;
+      CREATE INDEX IF NOT EXISTS idx_memory_refs_thread ON memory_references(thread_id);
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {
