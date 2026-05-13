@@ -438,7 +438,7 @@ export class DiscordAdapter implements MessengerAdapter {
   }
 
   // -------------------------------------------------------------------------
-  // Reaction handling (✅ / ❌ on mail alert threads)
+  // Reaction handling (✅ / ❌ on mail alert threads or general threads)
   // -------------------------------------------------------------------------
 
   private async onReactionAdd(
@@ -457,46 +457,70 @@ export class DiscordAdapter implements MessengerAdapter {
     const mailThread =
       getMailThreadByMessageId(this.db, msg.id) ??
       getMailThread(this.db, msg.channelId);
-    if (!mailThread) return;
 
-    setMailThreadStatus(this.db, mailThread.discordThreadId, 'resolved');
-    log.info({ threadId: mailThread.discordThreadId, emoji }, 'mail thread resolved via reaction');
-    logEvent(this.db, {
-      type: 'mail.resolved',
-      threadId: mailThread.discordThreadId,
-      summary: `${emoji} ${mailThread.subject}`,
-      meta: { emoji, discordMessageId: mailThread.discordMessageId },
-    });
+    if (mailThread) {
+      setMailThreadStatus(this.db, mailThread.discordThreadId, 'resolved');
+      log.info({ threadId: mailThread.discordThreadId, emoji }, 'mail thread resolved via reaction');
+      logEvent(this.db, {
+        type: 'mail.resolved',
+        threadId: mailThread.discordThreadId,
+        summary: `${emoji} ${mailThread.subject}`,
+        meta: { emoji, discordMessageId: mailThread.discordMessageId },
+      });
 
-    if (emoji === '❌') {
-      // Delete the thread (and all messages within it).
-      try {
-        const thread = await this.client.channels.fetch(mailThread.discordThreadId);
-        if (thread && 'delete' in thread && typeof (thread as { delete?: unknown }).delete === 'function') {
-          await (thread as { delete: () => Promise<unknown> }).delete();
-        }
-      } catch (err) {
-        log.error(
-          { err: (err as Error).message, threadId: mailThread.discordThreadId },
-          'failed to delete mail alert thread',
-        );
-      }
-
-      // Delete the parent channel message (starter message).
-      if (mailThread.discordMessageId) {
+      if (emoji === '❌') {
+        // Delete the thread (and all messages within it).
         try {
-          const alertChannel = await this.client.channels.fetch(this.config.mailAlertChannelId);
-          if (alertChannel && 'messages' in alertChannel) {
-            const parentMsg = await (alertChannel as { messages: { fetch: (id: string) => Promise<Message> } }).messages.fetch(mailThread.discordMessageId);
-            await parentMsg.delete();
+          const thread = await this.client.channels.fetch(mailThread.discordThreadId);
+          if (thread && 'delete' in thread && typeof (thread as { delete?: unknown }).delete === 'function') {
+            await (thread as { delete: () => Promise<unknown> }).delete();
           }
         } catch (err) {
           log.error(
-            { err: (err as Error).message, messageId: mailThread.discordMessageId },
-            'failed to delete mail alert message',
+            { err: (err as Error).message, threadId: mailThread.discordThreadId },
+            'failed to delete mail alert thread',
           );
         }
+
+        // Delete the parent channel message (starter message).
+        if (mailThread.discordMessageId) {
+          try {
+            const alertChannel = await this.client.channels.fetch(this.config.mailAlertChannelId);
+            if (alertChannel && 'messages' in alertChannel) {
+              const parentMsg = await (alertChannel as { messages: { fetch: (id: string) => Promise<Message> } }).messages.fetch(mailThread.discordMessageId);
+              await parentMsg.delete();
+            }
+          } catch (err) {
+            log.error(
+              { err: (err as Error).message, messageId: mailThread.discordMessageId },
+              'failed to delete mail alert message',
+            );
+          }
+        }
       }
+      return;
+    }
+
+    // General (non-mail) thread: ❌ deletes the thread channel.
+    if (emoji !== '❌') return;
+
+    try {
+      const channel = await this.client.channels.fetch(msg.channelId);
+      if (channel && channel.isThread()) {
+        await (channel as { delete: () => Promise<unknown> }).delete();
+        log.info({ threadId: msg.channelId }, 'general thread deleted via ❌ reaction');
+        logEvent(this.db, {
+          type: 'thread.deleted',
+          threadId: msg.channelId,
+          summary: '❌ 리액션으로 스레드 삭제',
+          meta: { channelId: msg.channelId },
+        });
+      }
+    } catch (err) {
+      log.error(
+        { err: (err as Error).message, channelId: msg.channelId },
+        'failed to delete general thread',
+      );
     }
   }
 
