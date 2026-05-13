@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import fs from 'node:fs';
 
@@ -6,10 +8,13 @@ import { loadConfig } from './config.js';
 import { log } from './log.js';
 import { getDb, closeDb } from './state/db.js';
 import { mountDashboard } from './dashboard/routes.js';
-import { DiscordAdapter } from './adapters/discord.js';
+import { GatewayIpc } from './ipc/server.js';
+import { DiscordGatewayAdapter } from './adapters/discord-gateway.js';
 import { GmailAdapter } from './adapters/gmail.js';
 import { RepoSyncScheduler } from './scheduler/repo-sync.js';
 import { DreamingScheduler } from './scheduler/dreaming.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -17,7 +22,7 @@ async function main(): Promise<void> {
   fs.mkdirSync(config.paths.dataDir, { recursive: true });
   fs.mkdirSync(config.paths.logsDir, { recursive: true });
 
-  log.info({ pid: process.pid, dbFile: config.paths.dbFile, repos: config.repoChannels.length }, 'claw starting');
+  log.info({ pid: process.pid, dbFile: config.paths.dbFile, repos: config.repoChannels.length }, 'claw gateway starting');
 
   const db = getDb(config.paths.dbFile);
 
@@ -31,8 +36,19 @@ async function main(): Promise<void> {
     log.info({ port: config.env.DASHBOARD_PORT }, 'dashboard listening');
   });
 
-  // Discord
-  const discord = new DiscordAdapter({ config, db });
+  // Worker binary path (sibling dist/worker.js)
+  const workerBin = path.join(__dirname, 'worker.js');
+
+  // IPC server — spawns and manages the Worker process
+  const ipc = new GatewayIpc({
+    workerBin,
+    cwd: path.dirname(__dirname), // project root
+    env: process.env,
+  });
+  await ipc.start();
+
+  // Discord gateway adapter — holds Discord.js client
+  const discord = new DiscordGatewayAdapter({ config, db, ipc });
   await discord.start();
 
   // Repo sync: polls every 10 min, only runs when idle 30+ min
@@ -73,6 +89,7 @@ async function main(): Promise<void> {
       dreaming.stop();
       await discord.stop();
       if (gmail) await gmail.stop();
+      await ipc.stop();
       closeDb();
     } catch (err) {
       log.error({ err }, 'shutdown error');
@@ -86,7 +103,7 @@ async function main(): Promise<void> {
     void shutdown('uncaughtException');
   });
 
-  log.info('claw running');
+  log.info('claw gateway running');
 }
 
 main().catch((err) => {

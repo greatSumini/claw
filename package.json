@@ -10,6 +10,8 @@
     "build": "tsc",
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
+    "start:gateway": "node dist/server.js",
+    "start:worker": "node dist/worker.js",
     "typecheck": "tsc --noEmit",
     "setup": "tsx scripts/setup.ts",
     "migrate": "tsx src/state/migrate.ts",

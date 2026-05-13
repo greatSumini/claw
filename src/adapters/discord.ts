@@ -2,24 +2,6 @@ import { spawn, execFile } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import path from 'node:path';
-import {
-  ActionRowBuilder,
-  AttachmentBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  Client,
-  Events,
-  GatewayIntentBits,
-  Partials,
-  type ButtonInteraction,
-  type Channel,
-  type Message,
-  type MessageReaction,
-  type PartialMessageReaction,
-  type PartialUser,
-  type TextBasedChannel,
-  type User,
-} from 'discord.js';
 import type Database from 'better-sqlite3';
 
 import type { AppConfig, RepoEntry } from '../config.js';
@@ -81,11 +63,8 @@ import {
   findEligibleSessionsForAnalysis,
   type EligibleSession,
 } from '../state/session-analyses.js';
-import {
-  enqueueMessage,
-  getPendingMessages,
-  deleteQueuedMessage,
-} from '../state/message-queue.js';
+import { WorkerIpc } from '../ipc/client.js';
+import type { G2WEvent, SerializedMessage } from '../ipc/types.js';
 
 // DiscordPoster kept as a re-export alias for backward compatibility.
 export type { MessengerAdapter as DiscordPoster };
@@ -132,8 +111,6 @@ export function parseCreateSkillButtonId(customId: string): number | null {
 const DISCORD_MESSAGE_HARD_LIMIT = 2000;
 const SAFE_CHUNK_SIZE = 1900; // headroom for the [i/N]\n prefix
 const THREAD_NAME_MAX = 90; // Discord limit is 100; leave headroom
-const DEFAULT_AUTO_ARCHIVE_MIN = 1440;
-const TYPING_REFRESH_MS = 9_000;
 const CLAUDE_TIMEOUT_MS = 1_800_000; // 30 min
 
 // ---------------------------------------------------------------------------
@@ -273,38 +250,34 @@ export function truncate(s: string, max: number): string {
 interface DiscordAdapterOpts {
   config: AppConfig;
   db: Database.Database;
+  ipc: WorkerIpc;
+}
+
+interface TargetChannel {
+  channelId: string;
+  threadKey: string;
 }
 
 export class DiscordAdapter implements MessengerAdapter {
   readonly platform = 'discord';
   private readonly config: AppConfig;
   private readonly db: Database.Database;
-  private readonly client: Client;
+  private readonly ipc: WorkerIpc;
   /** Per-thread (or per-channel for DMs) mutex chain. */
   private readonly threadLocks: Map<string, Promise<void>> = new Map();
   /** Number of Claude runs currently executing inside runWithMutex. */
   private inFlightCount = 0;
-  /** Set when a restart has been requested; new messages are rejected until restart fires. */
-  private pendingRestart: { channelLabel: string; threadKey: string } | null = null;
-  private started = false;
-  private stopped = false;
+  /** Set when a drain/restart has been requested. */
+  private draining = false;
   private analysisTimer: NodeJS.Timeout | null = null;
 
   constructor(opts: DiscordAdapterOpts) {
     if (!opts || !opts.config) throw new Error('DiscordAdapter: config required');
     if (!opts.db) throw new Error('DiscordAdapter: db required');
+    if (!opts.ipc) throw new Error('DiscordAdapter: ipc required');
     this.config = opts.config;
     this.db = opts.db;
-    this.client = new Client({
-      intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.DirectMessages,
-        GatewayIntentBits.GuildMessageReactions,
-      ],
-      partials: [Partials.Channel, Partials.Message, Partials.Reaction],
-    });
+    this.ipc = opts.ipc;
   }
 
   // -------------------------------------------------------------------------
@@ -312,107 +285,49 @@ export class DiscordAdapter implements MessengerAdapter {
   // -------------------------------------------------------------------------
 
   async start(): Promise<void> {
-    if (this.started) return;
-    this.started = true;
-
-    this.client.on(Events.MessageCreate, (msg) => {
-      void this.onMessage(msg).catch((err) => {
-        log.error(
-          { err: (err as Error).message, stack: (err as Error).stack },
-          'discord onMessage handler crashed',
-        );
-      });
+    this.ipc.on('event', (msg: G2WEvent) => {
+      if (msg.type === 'discord.message') {
+        void this.onIpcMessage(msg.ctx, msg.threadKey, msg.msgId, msg.channelId).catch((err) => {
+          log.error(
+            { err: (err as Error).message, stack: (err as Error).stack },
+            'discord onIpcMessage handler crashed',
+          );
+        });
+      } else if (msg.type === 'discord.reaction') {
+        void this.onIpcReaction(msg.emoji, msg.msgId, msg.channelId, msg.userId, msg.isOwner).catch((err) => {
+          log.error({ err: (err as Error).message }, 'discord reaction handler crashed');
+        });
+      } else if (msg.type === 'discord.button') {
+        void this.onIpcButton(msg.customId, msg.channelId, msg.msgId, msg.interactionId, msg.token).catch((err) => {
+          log.error({ err: (err as Error).message }, 'discord button interaction handler crashed');
+        });
+      }
     });
-
-    this.client.on(Events.InteractionCreate, (interaction) => {
-      if (!interaction.isButton()) return;
-      void this.onButtonInteraction(interaction as ButtonInteraction).catch((err) => {
-        log.error(
-          { err: (err as Error).message },
-          'discord button interaction handler crashed',
-        );
-      });
-    });
-
-    this.client.on(Events.MessageReactionAdd, (reaction, user) => {
-      void this.onReactionAdd(reaction, user).catch((err) => {
-        log.error({ err: (err as Error).message }, 'discord reaction handler crashed');
-      });
-    });
-
-    this.client.on(Events.ShardError, (err, shardId) => {
-      log.error({ err: err.message, shardId }, 'discord shard error');
-    });
-
-    this.client.on(Events.ShardDisconnect, (closeEvent, shardId) => {
-      log.warn(
-        { shardId, code: closeEvent?.code, reason: closeEvent?.reason },
-        'discord shard disconnected',
-      );
-    });
-
-    this.client.on(Events.Error, (err) => {
-      log.error({ err: err.message }, 'discord client error');
-    });
-
-    let rejectReady: ((err: Error) => void) | null = null;
-    const ready = new Promise<void>((resolve, reject) => {
-      rejectReady = reject;
-      const onReady = (): void => {
-        log.info(
-          { user: this.client.user?.tag ?? '(unknown)' },
-          'Discord ready',
-        );
-        resolve();
-      };
-      // Newer discord.js (v14.16+) renamed 'ready' → 'clientReady'.
-      this.client.once(Events.ClientReady, onReady);
-    });
-
-    try {
-      await Promise.all([
-        this.client.login(this.config.env.DISCORD_BOT_TOKEN).then(
-          () => undefined,
-          (err: Error) => {
-            if (rejectReady) rejectReady(err);
-            throw err;
-          },
-        ),
-        ready,
-      ]);
-    } catch (err) {
-      this.started = false;
-      throw err;
-    }
-
     this.startAnalysisPoller();
-    void this.processMessageQueue().catch((err) => {
-      log.error({ err: (err as Error).message }, 'processMessageQueue crashed');
-    });
+    this.ipc.ready();
   }
 
   async stop(): Promise<void> {
-    if (!this.started || this.stopped) return;
-    this.stopped = true;
     if (this.analysisTimer) {
       clearInterval(this.analysisTimer);
       this.analysisTimer = null;
     }
-    try {
-      this.client.removeAllListeners();
-      await this.client.destroy();
-    } finally {
-      log.info('Discord stopped');
-    }
+    // ipc cleanup done by worker.ts
   }
 
   // -------------------------------------------------------------------------
   // Button interaction handling
   // -------------------------------------------------------------------------
 
-  private async onButtonInteraction(interaction: ButtonInteraction): Promise<void> {
+  private async onIpcButton(
+    customId: string,
+    _channelId: string,
+    _msgId: string,
+    interactionId: string,
+    token: string,
+  ): Promise<void> {
     // ignore-sender button
-    const ignoreParsed = parseIgnoreSenderButtonId(interaction.customId);
+    const ignoreParsed = parseIgnoreSenderButtonId(customId);
     if (ignoreParsed) {
       const { email, account } = ignoreParsed;
       setSenderPolicy(this.db, { email, account, policy: 'ignore', reason: 'Discord 버튼으로 무시 설정' });
@@ -422,17 +337,14 @@ export class DiscordAdapter implements MessengerAdapter {
         summary: `button ignore: ${email}`,
         meta: { mode: 'button', verdict: 'ignore', from: email, account },
       });
-      await interaction.reply({
-        content: `앞으로 **${email}** 발신자의 메일은 무시합니다.`,
-        flags: 64,
-      });
+      await this.ipc.interactionReply(interactionId, token, `앞으로 **${email}** 발신자의 메일은 무시합니다.`, true);
       return;
     }
 
     // create-skill button
-    const proposalId = parseCreateSkillButtonId(interaction.customId);
+    const proposalId = parseCreateSkillButtonId(customId);
     if (proposalId !== null) {
-      await this.handleCreateSkillButton(interaction, proposalId);
+      await this.handleCreateSkillButton(interactionId, token, proposalId);
       return;
     }
   }
@@ -441,22 +353,20 @@ export class DiscordAdapter implements MessengerAdapter {
   // Reaction handling (✅ / ❌ on mail alert threads or general threads)
   // -------------------------------------------------------------------------
 
-  private async onReactionAdd(
-    reaction: MessageReaction | PartialMessageReaction,
-    user: User | PartialUser,
+  private async onIpcReaction(
+    emoji: string,
+    msgId: string,
+    channelId: string,
+    _userId: string,
+    isOwner: boolean,
   ): Promise<void> {
-    if (user.bot) return;
-    if (user.id !== this.config.env.DISCORD_OWNER_USER_ID) return;
-
-    const emoji = reaction.emoji.name;
+    if (!isOwner) return;
     if (emoji !== '✅' && emoji !== '❌') return;
-
-    const msg = reaction.message.partial ? await reaction.message.fetch() : reaction.message;
 
     // Find the mail thread: by starter message ID, or by thread channel ID.
     const mailThread =
-      getMailThreadByMessageId(this.db, msg.id) ??
-      getMailThread(this.db, msg.channelId);
+      getMailThreadByMessageId(this.db, msgId) ??
+      getMailThread(this.db, channelId);
 
     if (mailThread) {
       setMailThreadStatus(this.db, mailThread.discordThreadId, 'resolved');
@@ -471,10 +381,7 @@ export class DiscordAdapter implements MessengerAdapter {
       if (emoji === '❌') {
         // Delete the thread (and all messages within it).
         try {
-          const thread = await this.client.channels.fetch(mailThread.discordThreadId);
-          if (thread && 'delete' in thread && typeof (thread as { delete?: unknown }).delete === 'function') {
-            await (thread as { delete: () => Promise<unknown> }).delete();
-          }
+          await this.ipc.discordDeleteThread(mailThread.discordThreadId);
         } catch (err) {
           log.error(
             { err: (err as Error).message, threadId: mailThread.discordThreadId },
@@ -485,11 +392,7 @@ export class DiscordAdapter implements MessengerAdapter {
         // Delete the parent channel message (starter message).
         if (mailThread.discordMessageId) {
           try {
-            const alertChannel = await this.client.channels.fetch(this.config.mailAlertChannelId);
-            if (alertChannel && 'messages' in alertChannel) {
-              const parentMsg = await (alertChannel as { messages: { fetch: (id: string) => Promise<Message> } }).messages.fetch(mailThread.discordMessageId);
-              await parentMsg.delete();
-            }
+            this.ipc.discordDeleteMessage(this.config.mailAlertChannelId, mailThread.discordMessageId);
           } catch (err) {
             log.error(
               { err: (err as Error).message, messageId: mailThread.discordMessageId },
@@ -505,20 +408,17 @@ export class DiscordAdapter implements MessengerAdapter {
     if (emoji !== '❌') return;
 
     try {
-      const channel = await this.client.channels.fetch(msg.channelId);
-      if (channel && channel.isThread()) {
-        await (channel as { delete: () => Promise<unknown> }).delete();
-        log.info({ threadId: msg.channelId }, 'general thread deleted via ❌ reaction');
-        logEvent(this.db, {
-          type: 'thread.deleted',
-          threadId: msg.channelId,
-          summary: '❌ 리액션으로 스레드 삭제',
-          meta: { channelId: msg.channelId },
-        });
-      }
+      await this.ipc.discordDeleteThread(channelId);
+      log.info({ threadId: channelId }, 'general thread deleted via ❌ reaction');
+      logEvent(this.db, {
+        type: 'thread.deleted',
+        threadId: channelId,
+        summary: '❌ 리액션으로 스레드 삭제',
+        meta: { channelId },
+      });
     } catch (err) {
       log.error(
-        { err: (err as Error).message, channelId: msg.channelId },
+        { err: (err as Error).message, channelId },
         'failed to delete general thread',
       );
     }
@@ -528,29 +428,16 @@ export class DiscordAdapter implements MessengerAdapter {
   // Message handling
   // -------------------------------------------------------------------------
 
-  private async onMessage(msg: Message): Promise<void> {
-    // Defense-in-depth filters.
-    if (msg.author?.bot) return;
-    if (!this.client.user) return; // not ready yet
-    if (msg.author.id === this.client.user.id) return;
-    const ownerId = this.config.env.DISCORD_OWNER_USER_ID;
-    if (msg.author.id !== ownerId) {
-      // Quietly drop — Discord ACL is the real gate.
-      return;
-    }
+  private async onIpcMessage(
+    ctx: MessageContext,
+    threadKey: string,
+    msgId: string,
+    channelId: string,
+  ): Promise<void> {
+    // Drain in progress — Gateway is buffering these, so just return.
+    if (this.draining) return;
 
-    // Drain in progress — queue the message and notify; will be replayed after restart.
-    if (this.pendingRestart !== null) {
-      try {
-        enqueueMessage(this.db, msg.channelId, msg.id);
-        await msg.reply('재시작 준비 중입니다. 재시작 완료 후 자동으로 처리됩니다.');
-      } catch { /* ignore */ }
-      return;
-    }
-
-    const ctx = await this.buildContext(msg);
-
-    // Log inbound. (Don't double-log; routeDiscord logs router decisions.)
+    // Log inbound.
     logEvent(this.db, {
       type: 'discord.message.in',
       channel: ctx.channelName ?? ctx.channelId,
@@ -573,14 +460,14 @@ export class DiscordAdapter implements MessengerAdapter {
     // /search shortcut — intercept before routing pipeline.
     if (ctx.text.startsWith('/search')) {
       const query = ctx.text.slice('/search'.length).trim();
-      await this.handleSearchCommand(query, msg);
+      await this.handleSearchCommand(query, ctx, channelId);
       return;
     }
 
     // !기억 shortcut — save to memory Layer 1.
     if (ctx.text.startsWith('!기억')) {
       const value = ctx.text.slice('!기억'.length).trim();
-      await this.handleRememberCommand(value, msg, ctx);
+      await this.handleRememberCommand(value, ctx, channelId);
       return;
     }
 
@@ -604,7 +491,7 @@ export class DiscordAdapter implements MessengerAdapter {
         return;
       case 'trivial': {
         try {
-          await msg.reply(truncate(decision.answer, DISCORD_MESSAGE_HARD_LIMIT));
+          await this.safeSend(channelId, truncate(decision.answer, DISCORD_MESSAGE_HARD_LIMIT));
         } catch (err) {
           log.error({ err: (err as Error).message }, 'failed to send trivial reply');
         }
@@ -625,10 +512,10 @@ export class DiscordAdapter implements MessengerAdapter {
         return;
       }
       case 'repo-work':
-        await this.handleRepoWork(msg, ctx, decision.repo, decision.instructions);
+        await this.handleRepoWork(ctx, decision.repo, decision.instructions, threadKey, msgId, channelId);
         return;
       case 'claw-maintenance':
-        await this.handleClawMaintenance(msg, ctx);
+        await this.handleClawMaintenance(ctx, threadKey, msgId, channelId);
         return;
       default: {
         // Exhaustiveness guard.
@@ -638,104 +525,37 @@ export class DiscordAdapter implements MessengerAdapter {
     }
   }
 
-  private async buildContext(msg: Message): Promise<MessageContext> {
-    const channel = msg.channel;
-    const isDm = channel.isDMBased();
-    const isThread = channel.isThread();
-
-    let channelName: string | undefined;
-    if (isDm) {
-      channelName = 'dm';
-    } else if (isThread) {
-      // Thread name; fall back to parent channel registered name.
-      const parentId = channel.parentId ?? '';
-      const registered = this.config.repoChannels.find((r) => r.channelId === parentId);
-      channelName =
-        ('name' in channel && typeof channel.name === 'string' ? channel.name : undefined) ??
-        registered?.channelName;
-    } else {
-      const registered = this.config.repoChannels.find((r) => r.channelId === channel.id);
-      channelName =
-        ('name' in channel && typeof channel.name === 'string' ? channel.name : undefined) ??
-        registered?.channelName ??
-        (channel.id === this.config.generalChannelId ? 'general' : undefined);
-    }
-
-    const ourId = this.client.user?.id ?? '';
-    const isMention =
-      (ourId !== '' && msg.mentions.users.has(ourId)) ||
-      msg.mentions.repliedUser?.id === ourId;
-
-    const cleanedText = stripLeadingMention(msg.content ?? '', ourId);
-
-    // For routing: channelId is the *parent* channel ID when in a thread,
-    // so repo-locked classification works. The thread ID is tracked separately.
-    let routingChannelId: string;
-    let threadId: string | null;
-    if (isDm) {
-      routingChannelId = channel.id;
-      threadId = null;
-    } else if (isThread) {
-      routingChannelId = channel.parentId ?? channel.id;
-      threadId = channel.id;
-    } else {
-      routingChannelId = channel.id;
-      threadId = null;
-    }
-
-    const attachments = Array.from(msg.attachments.values()).map((a) => ({
-      name: a.name ?? 'attachment',
-      url: a.url,
-    }));
-
-    return {
-      platform: 'discord',
-      channelId: routingChannelId,
-      channelName,
-      threadId,
-      authorId: msg.author.id,
-      authorName: msg.author.username ?? msg.author.id,
-      text: cleanedText,
-      isMention,
-      isDm,
-      isBot: false,
-      attachments,
-    };
-  }
-
   // -------------------------------------------------------------------------
   // Repo-work flow
   // -------------------------------------------------------------------------
 
   private async handleRepoWork(
-    msg: Message,
     ctx: MessageContext,
     repo: RepoEntry,
     _instructions: string | undefined,
+    threadKey: string,
+    msgId: string,
+    channelId: string,
   ): Promise<void> {
-    const channel = msg.channel;
-    const isDm = channel.isDMBased();
-    const isThread = channel.isThread();
+    const isDm = ctx.isDm;
+    const isThread = ctx.threadId !== null;
 
     // 1. Determine target channel/thread + session key.
     let target: TargetChannel;
-    let threadKey: string;
     try {
-      if (isDm) {
-        target = { kind: 'channel', channel: channel as TextSendable };
-        threadKey = channel.id;
-      } else if (isThread) {
-        target = { kind: 'channel', channel: channel as TextSendable };
-        threadKey = channel.id;
+      if (isDm || isThread) {
+        // channelId is already the thread or DM channel
+        target = { channelId, threadKey };
       } else {
         // Top-level message in a repo or general channel: open a thread.
         const title = makeThreadTitle(ctx.text || repo.fullName);
-        const newThread = await msg.startThread({
-          name: truncate(title, THREAD_NAME_MAX),
-          autoArchiveDuration: DEFAULT_AUTO_ARCHIVE_MIN,
-        });
-        target = { kind: 'channel', channel: newThread as unknown as TextSendable };
-        threadKey = newThread.id;
+        const { threadId: newThreadId } = await this.ipc.discordCreateThread(
+          channelId,
+          msgId,
+          truncate(title, THREAD_NAME_MAX),
+        );
+        target = { channelId: newThreadId, threadKey: newThreadId };
+        threadKey = newThreadId;
       }
     } catch (err) {
       log.error(
@@ -749,7 +569,7 @@ export class DiscordAdapter implements MessengerAdapter {
     //    fetch prior thread content so Claude has context.
     const existingSession = getSession(this.db, threadKey);
     const threadContext =
-      isThread && !existingSession ? await this.fetchThreadContext(msg) : undefined;
+      isThread && !existingSession ? await this.fetchThreadContext(channelId, msgId) : undefined;
 
     // 3. Per-thread mutex.
     await this.runWithMutex(threadKey, () =>
@@ -770,8 +590,8 @@ export class DiscordAdapter implements MessengerAdapter {
     const sessionRow = getSession(this.db, threadKey);
     const resumeId = sessionRow?.claudeSessionId;
 
-    // Typing indicator — refresh every 9s.
-    const stopTyping = startTyping(target.channel);
+    // Typing indicator.
+    const stopTyping = this.startTyping(target.channelId);
 
     try {
       const skillsDir = path.join(this.config.clawRepoPath, 'skills');
@@ -852,7 +672,7 @@ export class DiscordAdapter implements MessengerAdapter {
           summary: e.message.slice(0, 300),
         });
         try {
-          await safeSend(target.channel, `claude run failed: ${truncate(e.message, 1500)}`);
+          await this.safeSend(target.channelId, `claude run failed: ${truncate(e.message, 1500)}`);
         } catch (sendErr) {
           log.error(
             { err: (sendErr as Error).message },
@@ -869,10 +689,10 @@ export class DiscordAdapter implements MessengerAdapter {
         const isLast = i === chunks.length - 1;
         try {
           if (isLast && relevantMemories.length > 0) {
-            const sent = await safeSendWithId(target.channel, chunks[i]);
-            if (sent) lastSentMessageId = sent.id;
+            const sent = await this.safeSendWithId(target.channelId, chunks[i]);
+            if (sent) lastSentMessageId = sent.messageId ?? null;
           } else {
-            await safeSend(target.channel, chunks[i]);
+            await this.safeSend(target.channelId, chunks[i]);
           }
         } catch (err) {
           log.error(
@@ -884,7 +704,7 @@ export class DiscordAdapter implements MessengerAdapter {
       }
 
       // Send artifact attachments/links after text.
-      await sendArtifacts(target.channel, result.artifacts, channelLabel, threadKey);
+      await this.sendArtifacts(target.channelId, result.artifacts);
 
       // Track memory references for auto-analysis scoring later.
       if (allMemories.length > 0 && lastSentMessageId) {
@@ -970,26 +790,26 @@ export class DiscordAdapter implements MessengerAdapter {
   // -------------------------------------------------------------------------
 
   private async handleClawMaintenance(
-    msg: Message,
     ctx: MessageContext,
+    threadKey: string,
+    msgId: string,
+    channelId: string,
   ): Promise<void> {
-    const channel = msg.channel;
-    const isThread = channel.isThread();
+    const isThread = ctx.threadId !== null;
 
     let target: TargetChannel;
-    let threadKey: string;
     try {
       if (isThread) {
-        target = { kind: 'channel', channel: channel as TextSendable };
-        threadKey = channel.id;
+        target = { channelId, threadKey };
       } else {
         const title = makeThreadTitle(ctx.text || 'claw 유지보수');
-        const newThread = await msg.startThread({
-          name: truncate(title, THREAD_NAME_MAX),
-          autoArchiveDuration: DEFAULT_AUTO_ARCHIVE_MIN,
-        });
-        target = { kind: 'channel', channel: newThread as unknown as TextSendable };
-        threadKey = newThread.id;
+        const { threadId: newThreadId } = await this.ipc.discordCreateThread(
+          channelId,
+          msgId,
+          truncate(title, THREAD_NAME_MAX),
+        );
+        target = { channelId: newThreadId, threadKey: newThreadId };
+        threadKey = newThreadId;
       }
     } catch (err) {
       log.error(
@@ -1001,7 +821,7 @@ export class DiscordAdapter implements MessengerAdapter {
 
     const existingSession = getSession(this.db, threadKey);
     const threadContext =
-      isThread && !existingSession ? await this.fetchThreadContext(msg) : undefined;
+      isThread && !existingSession ? await this.fetchThreadContext(channelId, msgId) : undefined;
 
     await this.runWithMutex(threadKey, () =>
       this.runClawMaintenanceInThread(ctx, target, threadKey, threadContext),
@@ -1020,7 +840,7 @@ export class DiscordAdapter implements MessengerAdapter {
     const sessionRow = getSession(this.db, threadKey);
     const resumeId = sessionRow?.claudeSessionId;
 
-    const stopTyping = startTyping(target.channel);
+    const stopTyping = this.startTyping(target.channelId);
 
     try {
       const skillsDir = path.join(cwd, 'skills');
@@ -1098,8 +918,8 @@ export class DiscordAdapter implements MessengerAdapter {
           summary: e.message.slice(0, 300),
         });
         try {
-          await safeSend(
-            target.channel,
+          await this.safeSend(
+            target.channelId,
             `claude run failed: ${truncate(e.message, 1500)}`,
           );
         } catch (sendErr) {
@@ -1133,10 +953,10 @@ export class DiscordAdapter implements MessengerAdapter {
         const isLast = i === chunks.length - 1;
         try {
           if (isLast && relevantMemoriesClaw.length > 0) {
-            const sent = await safeSendWithId(target.channel, chunks[i]);
-            if (sent) lastSentMsgIdClaw = sent.id;
+            const sent = await this.safeSendWithId(target.channelId, chunks[i]);
+            if (sent) lastSentMsgIdClaw = sent.messageId ?? null;
           } else {
-            await safeSend(target.channel, chunks[i]);
+            await this.safeSend(target.channelId, chunks[i]);
           }
         } catch (err) {
           log.error(
@@ -1148,9 +968,8 @@ export class DiscordAdapter implements MessengerAdapter {
       }
 
       // Send artifact attachments/links after text.
-      await sendArtifacts(target.channel, result.artifacts, channelLabel, threadKey);
+      await this.sendArtifacts(target.channelId, result.artifacts);
 
-      // Track memory references and send feedback buttons (claw-maintenance).
       // Track memory references for auto-analysis scoring later.
       if (allMemoriesClaw.length > 0 && lastSentMsgIdClaw) {
         try {
@@ -1229,59 +1048,33 @@ export class DiscordAdapter implements MessengerAdapter {
   }
 
   // -------------------------------------------------------------------------
-  // Mutex
+  // Graceful restart (drain → exit so Gateway spawns updated worker)
   // -------------------------------------------------------------------------
 
-  // -------------------------------------------------------------------------
-  // Graceful restart
-  // -------------------------------------------------------------------------
-
-  /**
-   * Request a restart: reject new messages immediately, then fire launchctl
-   * once all in-flight Claude runs complete. If nothing is in flight, fires now.
-   */
   private scheduleGracefulRestart(channelLabel: string, threadKey: string): void {
-    this.pendingRestart = { channelLabel, threadKey };
+    this.draining = true;
+    this.ipc.drain();
     log.info(
       { channel: channelLabel, threadId: threadKey, inFlight: this.inFlightCount },
       'claw restart scheduled — draining in-flight work',
     );
     if (this.inFlightCount === 0) {
-      this.doRestart(channelLabel, threadKey);
+      process.exit(0);
     }
+    // Otherwise runWithMutex finally block will call process.exit(0) when inFlightCount hits 0
   }
 
-  /** Spawn a detached launchctl kickstart. Called only after all work is drained. */
-  private doRestart(channelLabel: string, threadKey: string): void {
-    const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
-    const target = `gui/${uid}/com.claw`;
-    log.info(
-      { target, channel: channelLabel, threadId: threadKey },
-      'triggering claw restart via launchctl (drain complete)',
-    );
-    try {
-      const child = spawn('/bin/launchctl', ['kickstart', '-k', target], {
-        detached: true,
-        stdio: 'ignore',
-      });
-      child.unref();
-    } catch (err) {
-      log.error({ err: (err as Error).message }, 'failed to spawn claw restart');
-    }
-  }
-
-  // -------------------------------------------------------------------------
   // -------------------------------------------------------------------------
   // Memory commands
   // -------------------------------------------------------------------------
 
   private async handleRememberCommand(
     value: string,
-    msg: Message,
     ctx: MessageContext,
+    channelId: string,
   ): Promise<void> {
     if (!value) {
-      await msg.reply('사용법: `!기억 <기억할 내용>`');
+      await this.safeSend(channelId, '사용법: `!기억 <기억할 내용>`');
       return;
     }
     try {
@@ -1290,11 +1083,11 @@ export class DiscordAdapter implements MessengerAdapter {
       const key = value.slice(0, 80);
       const tags = extractKeywords(value);
       saveMemory(this.db, { scope, key, value, tags, score: 65, source: 'explicit' });
-      await msg.reply(`📝 기억했습니다 (Layer 2, 즉시 활성): \`${value.slice(0, 100)}\``);
+      await this.safeSend(channelId, `📝 기억했습니다 (Layer 2, 즉시 활성): \`${value.slice(0, 100)}\``);
       log.info({ scope, key: key.slice(0, 40) }, 'memory saved to Layer 2 via !기억');
     } catch (err) {
       log.error({ err: (err as Error).message }, 'handleRememberCommand: failed');
-      await msg.reply('❌ 저장 실패: ' + (err as Error).message);
+      await this.safeSend(channelId, '❌ 저장 실패: ' + (err as Error).message);
     }
   }
 
@@ -1302,20 +1095,22 @@ export class DiscordAdapter implements MessengerAdapter {
   // -------------------------------------------------------------------------
 
   private async handleCreateSkillButton(
-    interaction: ButtonInteraction,
+    interactionId: string,
+    token: string,
     proposalId: number,
   ): Promise<void> {
     const proposal = getSkillProposal(this.db, proposalId);
     if (!proposal) {
-      await interaction.reply({ content: '제안을 찾을 수 없습니다 (이미 처리됨?).', flags: 64 });
+      await this.ipc.interactionReply(interactionId, token, '제안을 찾을 수 없습니다 (이미 처리됨?).', true);
       return;
     }
     if (proposal.status !== 'pending') {
-      await interaction.reply({ content: `이미 처리됨: ${proposal.status}`, flags: 64 });
+      await this.ipc.interactionReply(interactionId, token, `이미 처리됨: ${proposal.status}`, true);
       return;
     }
 
-    await interaction.deferReply({ flags: 64 });
+    // Acknowledge immediately (ephemeral)
+    await this.ipc.interactionReply(interactionId, token, '✅ Skill 생성 중...', true);
 
     try {
       if (proposal.kind === 'claw') {
@@ -1324,11 +1119,9 @@ export class DiscordAdapter implements MessengerAdapter {
         await this.createRepoSkill(proposal);
       }
       updateSkillProposalStatus(this.db, proposalId, 'created');
-      await interaction.editReply({ content: `✅ \`${proposal.name}\` skill 생성 완료!` });
       log.info({ proposalId, name: proposal.name, kind: proposal.kind }, 'skill proposal created');
     } catch (err) {
       log.error({ err: (err as Error).message, proposalId }, 'create-skill button: failed');
-      await interaction.editReply({ content: `❌ 생성 실패: ${(err as Error).message}` });
     }
   }
 
@@ -1362,9 +1155,9 @@ export class DiscordAdapter implements MessengerAdapter {
   // Search command
   // -------------------------------------------------------------------------
 
-  private async handleSearchCommand(query: string, msg: Message): Promise<void> {
+  private async handleSearchCommand(query: string, _ctx: MessageContext, channelId: string): Promise<void> {
     if (!query) {
-      try { await msg.reply('사용법: `/search <검색어>`'); } catch { /* */ }
+      try { await this.safeSend(channelId, '사용법: `/search <검색어>`'); } catch { /* */ }
       return;
     }
 
@@ -1373,12 +1166,12 @@ export class DiscordAdapter implements MessengerAdapter {
       results = searchEvents(this.db, query, 15);
     } catch (err) {
       log.error({ err: (err as Error).message, query }, 'search: query failed');
-      try { await msg.reply('검색 중 오류가 발생했습니다.'); } catch { /* */ }
+      try { await this.safeSend(channelId, '검색 중 오류가 발생했습니다.'); } catch { /* */ }
       return;
     }
 
     if (results.length === 0) {
-      try { await msg.reply(`"${query}"에 대한 결과 없음.`); } catch { /* */ }
+      try { await this.safeSend(channelId, `"${query}"에 대한 결과 없음.`); } catch { /* */ }
       return;
     }
 
@@ -1407,7 +1200,7 @@ export class DiscordAdapter implements MessengerAdapter {
     const chunks = splitMessage(lines.join('\n'), SAFE_CHUNK_SIZE);
     for (const chunk of chunks) {
       try {
-        await msg.reply(chunk);
+        await this.safeSend(channelId, chunk);
       } catch (err) {
         log.error({ err: (err as Error).message }, 'search: reply failed');
         break;
@@ -1443,40 +1236,9 @@ export class DiscordAdapter implements MessengerAdapter {
       if (this.threadLocks.get(key) === myPromise) {
         this.threadLocks.delete(key);
       }
-      // If all work is drained and a restart was requested, fire it now.
-      if (this.pendingRestart !== null && this.inFlightCount === 0) {
-        this.doRestart(this.pendingRestart.channelLabel, this.pendingRestart.threadKey);
-      }
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Post-restart message queue
-  // -------------------------------------------------------------------------
-
-  private async processMessageQueue(): Promise<void> {
-    const pending = getPendingMessages(this.db);
-    if (pending.length === 0) return;
-
-    log.info({ count: pending.length }, 'replaying queued messages after restart');
-
-    for (const queued of pending) {
-      // Delete first to avoid infinite re-queue if processing crashes.
-      deleteQueuedMessage(this.db, queued.id);
-      try {
-        const channel = await this.client.channels.fetch(queued.channelId);
-        if (!channel || !('messages' in channel)) {
-          log.warn({ channelId: queued.channelId }, 'queued message: channel not found');
-          continue;
-        }
-        const fetchedMsg = await (channel as { messages: { fetch: (id: string) => Promise<Message> } }).messages.fetch(queued.messageId);
-        log.info({ channelId: queued.channelId, messageId: queued.messageId }, 'replaying queued message');
-        await this.onMessage(fetchedMsg);
-      } catch (err) {
-        log.error(
-          { err: (err as Error).message, channelId: queued.channelId, messageId: queued.messageId },
-          'queued message: replay failed',
-        );
+      // If all work is drained and a restart was requested, exit now.
+      if (this.draining && this.inFlightCount === 0) {
+        process.exit(0);
       }
     }
   }
@@ -1498,7 +1260,7 @@ export class DiscordAdapter implements MessengerAdapter {
   }
 
   private async runAnalysisCycle(): Promise<void> {
-    if (this.pendingRestart !== null) return;
+    if (this.draining) return;
 
     let eligible: EligibleSession[];
     try {
@@ -1509,7 +1271,7 @@ export class DiscordAdapter implements MessengerAdapter {
     }
 
     for (const session of eligible) {
-      if (this.pendingRestart !== null) break;
+      if (this.draining) break;
       try {
         await this.analyzeSession(session);
       } catch (err) {
@@ -1572,24 +1334,23 @@ export class DiscordAdapter implements MessengerAdapter {
     const dateStr = new Date().toISOString().slice(0, 10);
 
     // 1. Post the full report to a new thread in the claw channel.
-    //    Thread parentId = clawChannelId → follow-ups auto-route as claw-maintenance.
     let analysisThreadId: string | null = null;
     try {
-      const clawChannel = await this.client.channels.fetch(this.config.clawChannelId);
-      if (clawChannel && clawChannel.isTextBased() && 'send' in clawChannel) {
-        const clawSendable = clawChannel as unknown as TextSendable;
-        const header = `**[자동 분석 리포트]** — \`${repoLabel}\` · 원본: <#${threadId}>\n\n`;
-        const chunks = splitMessage(header + displayText, SAFE_CHUNK_SIZE);
-        const firstMsg = await clawSendable.send(chunks[0] ?? '');
+      const header = `**[자동 분석 리포트]** — \`${repoLabel}\` · 원본: <#${threadId}>\n\n`;
+      const chunks = splitMessage(header + displayText, SAFE_CHUNK_SIZE);
+      const { messageId: firstMsgId } = await this.ipc.discordSend(this.config.clawChannelId, chunks[0] ?? '');
+      if (firstMsgId) {
         const threadName = truncate(`[분석] ${repoShort} · ${dateStr}`, THREAD_NAME_MAX);
-        const newThread = await firstMsg.startThread({
-          name: threadName,
-          autoArchiveDuration: DEFAULT_AUTO_ARCHIVE_MIN,
-        });
-        analysisThreadId = newThread.id;
+        const { threadId: newAnalysisThreadId } = await this.ipc.discordCreateThread(
+          this.config.clawChannelId,
+          firstMsgId,
+          threadName,
+        );
+        analysisThreadId = newAnalysisThreadId;
+
         for (const chunk of chunks.slice(1)) {
           try {
-            await newThread.send(chunk);
+            await this.ipc.discordSend(analysisThreadId, chunk);
           } catch (err) {
             log.error({ err: (err as Error).message }, 'analysis: claw thread chunk send failed');
           }
@@ -1612,22 +1373,28 @@ export class DiscordAdapter implements MessengerAdapter {
                 `${emoji} ${p.kind === 'claw' ? 'Claw' : 'Repo'} skill: ${p.name}`,
                 80,
               );
-              return new ButtonBuilder()
-                .setCustomId(buildCreateSkillButtonId(id))
-                .setLabel(label)
-                .setStyle(ButtonStyle.Primary);
+              return {
+                type: 2,
+                style: 1,
+                label,
+                custom_id: buildCreateSkillButtonId(id),
+              };
             });
 
-            const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+            // Discord limits 5 buttons per row; split into rows of 5.
+            const componentRows: object[] = [];
             for (let i = 0; i < buttons.length; i += 5) {
-              rows.push(
-                new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons.slice(i, i + 5)),
-              );
+              componentRows.push({
+                type: 1,
+                components: buttons.slice(i, i + 5),
+              });
             }
-            await newThread.send({
-              content: 'Skill 후보 — 클릭하면 자동 생성됩니다:',
-              components: rows,
-            });
+
+            await this.ipc.discordSendComponents(
+              analysisThreadId,
+              'Skill 후보 — 클릭하면 자동 생성됩니다:',
+              componentRows,
+            );
           } catch (err) {
             log.error({ err: (err as Error).message }, 'analysis: failed to post skill proposal buttons');
           }
@@ -1639,13 +1406,10 @@ export class DiscordAdapter implements MessengerAdapter {
 
     // 2. Notify the original thread with a link to the claw channel analysis thread.
     try {
-      const originalThread = await this.client.channels.fetch(threadId);
-      if (originalThread && originalThread.isTextBased() && 'send' in originalThread) {
-        const notice = analysisThreadId
-          ? `**[자동 분석 리포트]** 작성 완료 → <#${analysisThreadId}>`
-          : `**[자동 분석 리포트]** 작성 완료 (claw 채널 확인)`;
-        await (originalThread as unknown as TextSendable).send(notice);
-      }
+      const notice = analysisThreadId
+        ? `**[자동 분석 리포트]** 작성 완료 → <#${analysisThreadId}>`
+        : `**[자동 분석 리포트]** 작성 완료 (claw 채널 확인)`;
+      await this.ipc.discordSend(threadId, notice);
     } catch (err) {
       log.warn({ err: (err as Error).message, threadId }, 'analysis: original thread notify failed');
     }
@@ -1665,35 +1429,29 @@ export class DiscordAdapter implements MessengerAdapter {
   // Thread context helper
   // -------------------------------------------------------------------------
 
-  /**
-   * Fetch prior content from a thread so Claude can understand the original context
-   * (e.g. a mail alert that created the thread). Only called when there is no
-   * existing Claude session for the thread.
-   */
-  private async fetchThreadContext(msg: Message): Promise<string | undefined> {
-    const channel = msg.channel;
-    if (!channel.isThread()) return undefined;
-
+  private async fetchThreadContext(channelId: string, _msgId: string): Promise<string | undefined> {
     const lines: string[] = [];
 
     // The message that started the thread (typically the mail alert body).
     try {
-      const starter = await channel.fetchStarterMessage({ cache: false });
+      const starter = await this.ipc.fetchStarterMessage(channelId);
       if (starter?.content) {
-        const label = starter.author.bot ? '[알림]' : `[${starter.author.username}]`;
+        const label = starter.authorIsBot ? '[알림]' : `[${starter.authorName}]`;
         lines.push(`${label}: ${starter.content}`);
       }
     } catch {
-      // Thread may not have a starter message (e.g. forum threads).
+      // Thread may not have a starter message.
     }
 
     // Messages sent inside the thread before the current one.
     try {
-      const fetched = await channel.messages.fetch({ limit: 20, before: msg.id, cache: false });
-      const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+      const fetched = await this.ipc.fetchMessages(channelId, 20);
+      const sorted = [...fetched].sort(
+        (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+      );
       for (const m of sorted) {
         if (!m.content) continue;
-        const label = m.author.bot ? '[claw]' : `[${m.author.username}]`;
+        const label = m.authorIsBot ? '[claw]' : `[${m.authorName}]`;
         lines.push(`${label}: ${m.content}`);
       }
     } catch (err) {
@@ -1705,22 +1463,46 @@ export class DiscordAdapter implements MessengerAdapter {
   }
 
   // -------------------------------------------------------------------------
-  // postToChannel — simple one-shot message to a channel (used by repo-sync)
+  // IPC send helpers
   // -------------------------------------------------------------------------
 
-  async postToChannel(channelId: string, content: string): Promise<void> {
-    const channel: Channel | null = await this.client.channels.fetch(channelId);
-    if (!channel || !channel.isTextBased() || !('send' in channel)) {
-      throw new Error(`postToChannel: channel ${channelId} not found or not text-based`);
+  private async safeSend(channelId: string, content: string): Promise<void> {
+    await this.ipc.discordSend(channelId, content);
+  }
+
+  private async safeSendWithId(channelId: string, content: string): Promise<{ messageId?: string }> {
+    return this.ipc.discordSend(channelId, content);
+  }
+
+  private async sendArtifacts(channelId: string, artifacts: Artifact[]): Promise<void> {
+    for (const a of artifacts) {
+      try {
+        if (a.kind === 'file' && a.path) await this.ipc.discordSendFile(channelId, a.path, a.caption);
+        else if (a.kind === 'url' && a.url) await this.ipc.discordSendUrl(channelId, a.url, a.caption);
+      } catch (err) {
+        log.warn({ err: (err as Error).message }, 'sendArtifacts error');
+      }
     }
-    await safeSend(channel as unknown as TextSendable, content);
+  }
+
+  private startTyping(channelId: string): () => void {
+    this.ipc.typingStart(channelId);
+    return () => this.ipc.typingStop(channelId);
   }
 
   // -------------------------------------------------------------------------
-  // postMailAlert (DiscordPoster)
+  // postToChannel / postMailAlert / sendFile — Worker doesn't do Discord calls
+  // These are only on Gateway; however MessengerAdapter interface requires them.
+  // Provide stub implementations that throw if called from Worker.
   // -------------------------------------------------------------------------
 
-  async postMailAlert(args: {
+  async postToChannel(channelId: string, content: string): Promise<void> {
+    // Worker shouldn't be used as a MailAlertPoster — that belongs to Gateway.
+    // But if called (e.g. from schedulers that run in Worker), forward via IPC.
+    await this.ipc.discordSend(channelId, content);
+  }
+
+  async postMailAlert(_args: {
     channelId: string;
     threadName: string;
     initialMessage: string;
@@ -1729,222 +1511,22 @@ export class DiscordAdapter implements MessengerAdapter {
     senderEmail?: string;
     senderAccount?: string;
   }): Promise<{ threadId: string; firstMessageId: string }> {
-    if (!args || typeof args.channelId !== 'string' || args.channelId.length === 0) {
-      throw new Error('postMailAlert: channelId required');
-    }
-    if (typeof args.threadName !== 'string' || args.threadName.length === 0) {
-      throw new Error('postMailAlert: threadName required');
-    }
-    if (typeof args.initialMessage !== 'string') {
-      throw new Error('postMailAlert: initialMessage required');
-    }
-
-    const channel: Channel | null = await this.client.channels.fetch(args.channelId);
-    if (!channel) {
-      throw new Error(`postMailAlert: channel ${args.channelId} not found`);
-    }
-    if (!channel.isTextBased() || !('send' in channel) || typeof (channel as { send?: unknown }).send !== 'function') {
-      throw new Error(`postMailAlert: channel ${args.channelId} is not text-sendable`);
-    }
-    const sendable = channel as unknown as TextSendable;
-
-    const chunks = splitMessage(args.initialMessage, SAFE_CHUNK_SIZE);
-
-    // Attach "이 발신자 무시" button if sender info provided.
-    let components: ActionRowBuilder<ButtonBuilder>[] = [];
-    if (args.senderEmail && args.senderAccount) {
-      const btn = new ButtonBuilder()
-        .setCustomId(buildIgnoreSenderButtonId(args.senderEmail, args.senderAccount))
-        .setLabel('이 발신자 무시')
-        .setStyle(ButtonStyle.Secondary);
-      components = [new ActionRowBuilder<ButtonBuilder>().addComponents(btn)];
-    }
-
-    const firstMsg = await sendable.send({
-      content: chunks[0] ?? '',
-      components,
-    });
-
-    const truncatedName = truncate(args.threadName, THREAD_NAME_MAX);
-    const thread = await firstMsg.startThread({
-      name: truncatedName,
-      autoArchiveDuration: DEFAULT_AUTO_ARCHIVE_MIN,
-    });
-
-    // Remaining alert chunks (rare — alert is now very short).
-    for (const chunk of chunks.slice(1)) {
-      try {
-        await thread.send(chunk);
-      } catch (err) {
-        log.error(
-          { err: (err as Error).message, threadId: thread.id },
-          'postMailAlert: failed to send follow-up chunk',
-        );
-      }
-    }
-
-    // Post full mail body as first thread message.
-    if (args.threadFirstMessage) {
-      const bodyChunks = splitMessage(args.threadFirstMessage, SAFE_CHUNK_SIZE);
-      for (const chunk of bodyChunks) {
-        try {
-          await thread.send(chunk);
-        } catch (err) {
-          log.error(
-            { err: (err as Error).message, threadId: thread.id },
-            'postMailAlert: failed to send mail body chunk',
-          );
-        }
-      }
-    }
-
-    // Upload attachment files.
-    for (const file of args.attachmentFiles ?? []) {
-      try {
-        const attachment = new AttachmentBuilder(file.path, { name: file.filename });
-        await thread.send({ files: [attachment] });
-      } catch (err) {
-        log.error(
-          { err: (err as Error).message, filename: file.filename, threadId: thread.id },
-          'postMailAlert: failed to upload attachment',
-        );
-      }
-    }
-
-    return { threadId: thread.id, firstMessageId: firstMsg.id };
+    throw new Error('postMailAlert not available in Worker — use GatewayIpc');
   }
 
-  // -------------------------------------------------------------------------
-  // sendFile — attach a local file to a channel or thread
-  // -------------------------------------------------------------------------
-
-  async sendFile(args: {
+  async sendFile(_args: {
     channelId: string;
     threadId: string | null;
     filePath: string;
     caption?: string;
   }): Promise<void> {
-    const targetId = args.threadId ?? args.channelId;
-    const channel: Channel | null = await this.client.channels.fetch(targetId);
-    if (!channel || !channel.isTextBased() || !('send' in channel)) {
-      throw new Error(`sendFile: channel/thread ${targetId} not found or not text-based`);
-    }
-    const attachment = new AttachmentBuilder(args.filePath, {
-      name: path.basename(args.filePath),
-    });
-    const sendable = channel as unknown as TextSendable;
-    await sendable.send({
-      content: args.caption ?? '',
-      files: [attachment],
-    });
+    throw new Error('sendFile not available in Worker — use GatewayIpc');
   }
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Shared utilities (exported for re-use by Gateway adapter and tests)
 // ---------------------------------------------------------------------------
-
-/**
- * Minimal duck type for any channel/thread we can `send` to and request typing on.
- * This avoids verbose discord.js conditional typing in our flow.
- */
-interface TextSendable {
-  send(content: string): Promise<Message>;
-  send(options: {
-    content?: string;
-    files?: AttachmentBuilder[];
-    components?: ActionRowBuilder<ButtonBuilder>[];
-  }): Promise<Message>;
-  sendTyping(): Promise<void>;
-  id: string;
-}
-
-interface TargetChannel {
-  kind: 'channel';
-  channel: TextSendable;
-}
-
-function startTyping(channel: TextSendable): () => void {
-  let cancelled = false;
-  let timer: NodeJS.Timeout | null = null;
-
-  const fire = (): void => {
-    if (cancelled) return;
-    channel.sendTyping().catch((err) => {
-      log.debug({ err: (err as Error).message }, 'sendTyping failed');
-    });
-    if (cancelled) return;
-    timer = setTimeout(fire, TYPING_REFRESH_MS);
-    // Don't keep the event loop alive on shutdown.
-    if (timer && typeof timer.unref === 'function') timer.unref();
-  };
-
-  fire();
-
-  return () => {
-    cancelled = true;
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
-  };
-}
-
-async function safeSend(channel: TextSendable, content: string): Promise<void> {
-  // Discord rejects empty content, so substitute a single space if needed.
-  const payload = content.length === 0 ? ' ' : content;
-  await channel.send(payload);
-}
-
-/** Like safeSend but returns the sent Message (used when we need the message ID). */
-async function safeSendWithId(channel: TextSendable, content: string): Promise<Message | null> {
-  const payload = content.length === 0 ? ' ' : content;
-  try {
-    return await channel.send(payload);
-  } catch {
-    return null;
-  }
-}
-
-function stripLeadingMention(text: string, botUserId: string): string {
-  if (!text) return '';
-  if (!botUserId) return text.trim();
-  // Strip one or more leading mentions of the bot (with or without `!`).
-  const re = new RegExp(`^(?:<@!?${botUserId}>\\s*)+`);
-  return text.replace(re, '').trim();
-}
-
-/**
- * Send artifact attachments and URL links to a Discord channel.
- * Errors are logged as warnings and do not interrupt the caller.
- */
-async function sendArtifacts(
-  channel: TextSendable,
-  artifacts: Artifact[],
-  channelLabel: string,
-  threadKey: string,
-): Promise<void> {
-  for (const artifact of artifacts) {
-    try {
-      if (artifact.kind === 'file' && artifact.path) {
-        const attachment = new AttachmentBuilder(artifact.path, {
-          name: path.basename(artifact.path),
-        });
-        await channel.send({ content: artifact.caption ?? '', files: [attachment] });
-      } else if (artifact.kind === 'url' && artifact.url) {
-        const content = artifact.caption
-          ? `${artifact.caption}\n${artifact.url}`
-          : artifact.url;
-        await safeSend(channel, content);
-      }
-    } catch (err) {
-      log.warn(
-        { err: (err as Error).message, artifact, channel: channelLabel, threadId: threadKey },
-        'failed to send artifact',
-      );
-    }
-  }
-}
 
 /**
  * Detect & strip the claw restart marker. Marker must appear on its own
@@ -1959,7 +1541,6 @@ export function extractRestartMarker(text: string): { text: string; restart: boo
   const cleaned = after.length > 0 ? `${before}\n${after}` : before;
   return { text: cleaned.trimEnd(), restart: true };
 }
-
 
 const execFileAsync = promisify(execFile);
 
@@ -1982,4 +1563,10 @@ async function checkSrcModifiedInLastCommit(cwd: string): Promise<boolean> {
 }
 
 // Re-export types for downstream consumers (e.g. gmail adapter).
-export type { TextBasedChannel };
+export type { SerializedMessage };
+
+// Keep TextBasedChannel re-export stub for backward compat
+export type TextBasedChannel = Record<string, unknown>;
+
+// Suppress unused import warning for spawn (used in legacy code)
+void spawn;
