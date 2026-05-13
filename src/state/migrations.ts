@@ -226,6 +226,12 @@ const MIGRATIONS: Migration[] = [
       ALTER TABLE memories ADD COLUMN embedding TEXT;
     `,
   },
+  {
+    name: '010_mail_threads_message_id',
+    sql: `
+      ALTER TABLE mail_threads ADD COLUMN discord_message_id TEXT;
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

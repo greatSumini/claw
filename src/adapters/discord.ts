@@ -14,7 +14,11 @@ import {
   type ButtonInteraction,
   type Channel,
   type Message,
+  type MessageReaction,
+  type PartialMessageReaction,
+  type PartialUser,
   type TextBasedChannel,
+  type User,
 } from 'discord.js';
 import type Database from 'better-sqlite3';
 
@@ -66,7 +70,12 @@ import type { MessageContext } from '../messenger/types.js';
 import type { MessengerAdapter } from '../messenger/types.js';
 import { downloadAttachments, attachmentNote } from '../attachments.js';
 import { type Artifact } from '../artifact.js';
-import { setSenderPolicy } from '../state/mail.js';
+import {
+  setSenderPolicy,
+  getMailThread,
+  getMailThreadByMessageId,
+  setMailThreadStatus,
+} from '../state/mail.js';
 import {
   upsertSessionAnalysis,
   findEligibleSessionsForAnalysis,
@@ -292,8 +301,9 @@ export class DiscordAdapter implements MessengerAdapter {
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.DirectMessages,
+        GatewayIntentBits.GuildMessageReactions,
       ],
-      partials: [Partials.Channel, Partials.Message],
+      partials: [Partials.Channel, Partials.Message, Partials.Reaction],
     });
   }
 
@@ -324,6 +334,11 @@ export class DiscordAdapter implements MessengerAdapter {
       });
     });
 
+    this.client.on(Events.MessageReactionAdd, (reaction, user) => {
+      void this.onReactionAdd(reaction, user).catch((err) => {
+        log.error({ err: (err as Error).message }, 'discord reaction handler crashed');
+      });
+    });
 
     this.client.on(Events.ShardError, (err, shardId) => {
       log.error({ err: err.message, shardId }, 'discord shard error');
@@ -419,6 +434,53 @@ export class DiscordAdapter implements MessengerAdapter {
     if (proposalId !== null) {
       await this.handleCreateSkillButton(interaction, proposalId);
       return;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Reaction handling (✅ / ❌ on mail alert threads)
+  // -------------------------------------------------------------------------
+
+  private async onReactionAdd(
+    reaction: MessageReaction | PartialMessageReaction,
+    user: User | PartialUser,
+  ): Promise<void> {
+    if (user.bot) return;
+    if (user.id !== this.config.env.DISCORD_OWNER_USER_ID) return;
+
+    const emoji = reaction.emoji.name;
+    if (emoji !== '✅' && emoji !== '❌') return;
+
+    const msg = reaction.message.partial ? await reaction.message.fetch() : reaction.message;
+
+    // Find the mail thread: by starter message ID, or by thread channel ID.
+    const mailThread =
+      getMailThreadByMessageId(this.db, msg.id) ??
+      getMailThread(this.db, msg.channelId);
+    if (!mailThread) return;
+
+    setMailThreadStatus(this.db, mailThread.discordThreadId, 'resolved');
+    log.info({ threadId: mailThread.discordThreadId, emoji }, 'mail thread resolved via reaction');
+    logEvent(this.db, {
+      type: 'mail.resolved',
+      threadId: mailThread.discordThreadId,
+      summary: `${emoji} ${mailThread.subject}`,
+      meta: { emoji, discordMessageId: mailThread.discordMessageId },
+    });
+
+    if (emoji === '❌' && mailThread.discordMessageId) {
+      try {
+        const alertChannel = await this.client.channels.fetch(this.config.mailAlertChannelId);
+        if (alertChannel && 'messages' in alertChannel) {
+          const parentMsg = await (alertChannel as { messages: { fetch: (id: string) => Promise<Message> } }).messages.fetch(mailThread.discordMessageId);
+          await parentMsg.delete();
+        }
+      } catch (err) {
+        log.error(
+          { err: (err as Error).message, messageId: mailThread.discordMessageId },
+          'failed to delete mail alert message',
+        );
+      }
     }
   }
 

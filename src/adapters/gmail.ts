@@ -622,6 +622,7 @@ export class GmailAdapter {
 
     createMailThread(this.db, {
       discordThreadId: posted.threadId,
+      discordMessageId: posted.firstMessageId,
       gmailMsgId: mail.messageId,
       gmailThreadId: mail.threadId,
       account: mail.account,
