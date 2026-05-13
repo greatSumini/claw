@@ -468,18 +468,34 @@ export class DiscordAdapter implements MessengerAdapter {
       meta: { emoji, discordMessageId: mailThread.discordMessageId },
     });
 
-    if (emoji === '❌' && mailThread.discordMessageId) {
+    if (emoji === '❌') {
+      // Delete the thread (and all messages within it).
       try {
-        const alertChannel = await this.client.channels.fetch(this.config.mailAlertChannelId);
-        if (alertChannel && 'messages' in alertChannel) {
-          const parentMsg = await (alertChannel as { messages: { fetch: (id: string) => Promise<Message> } }).messages.fetch(mailThread.discordMessageId);
-          await parentMsg.delete();
+        const thread = await this.client.channels.fetch(mailThread.discordThreadId);
+        if (thread && 'delete' in thread && typeof (thread as { delete?: unknown }).delete === 'function') {
+          await (thread as { delete: () => Promise<unknown> }).delete();
         }
       } catch (err) {
         log.error(
-          { err: (err as Error).message, messageId: mailThread.discordMessageId },
-          'failed to delete mail alert message',
+          { err: (err as Error).message, threadId: mailThread.discordThreadId },
+          'failed to delete mail alert thread',
         );
+      }
+
+      // Delete the parent channel message (starter message).
+      if (mailThread.discordMessageId) {
+        try {
+          const alertChannel = await this.client.channels.fetch(this.config.mailAlertChannelId);
+          if (alertChannel && 'messages' in alertChannel) {
+            const parentMsg = await (alertChannel as { messages: { fetch: (id: string) => Promise<Message> } }).messages.fetch(mailThread.discordMessageId);
+            await parentMsg.delete();
+          }
+        } catch (err) {
+          log.error(
+            { err: (err as Error).message, messageId: mailThread.discordMessageId },
+            'failed to delete mail alert message',
+          );
+        }
       }
     }
   }
