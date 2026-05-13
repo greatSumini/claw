@@ -21,7 +21,7 @@ const Schema = z.object({
   GMAIL_CLIENT_SECRET: z.string().optional().default(''),
   // GMAIL_REFRESH_TOKEN_1..N are read dynamically from process.env
 
-  MAIL_POLL_INTERVAL_SEC: z.coerce.number().default(600),
+  MAIL_POLL_INTERVAL_SEC: z.coerce.number().default(300),
 
   DASHBOARD_PORT: z.coerce.number().default(3200),
   DASHBOARD_SECRET: z.string().min(8),
