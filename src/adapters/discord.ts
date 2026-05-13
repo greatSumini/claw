@@ -1622,6 +1622,8 @@ export class DiscordAdapter implements MessengerAdapter {
     channelId: string;
     threadName: string;
     initialMessage: string;
+    threadFirstMessage?: string;
+    attachmentFiles?: { path: string; filename: string }[];
     senderEmail?: string;
     senderAccount?: string;
   }): Promise<{ threadId: string; firstMessageId: string }> {
@@ -1667,6 +1669,7 @@ export class DiscordAdapter implements MessengerAdapter {
       autoArchiveDuration: DEFAULT_AUTO_ARCHIVE_MIN,
     });
 
+    // Remaining alert chunks (rare — alert is now very short).
     for (const chunk of chunks.slice(1)) {
       try {
         await thread.send(chunk);
@@ -1675,7 +1678,34 @@ export class DiscordAdapter implements MessengerAdapter {
           { err: (err as Error).message, threadId: thread.id },
           'postMailAlert: failed to send follow-up chunk',
         );
-        // Continue trying remaining chunks rather than abort entirely.
+      }
+    }
+
+    // Post full mail body as first thread message.
+    if (args.threadFirstMessage) {
+      const bodyChunks = splitMessage(args.threadFirstMessage, SAFE_CHUNK_SIZE);
+      for (const chunk of bodyChunks) {
+        try {
+          await thread.send(chunk);
+        } catch (err) {
+          log.error(
+            { err: (err as Error).message, threadId: thread.id },
+            'postMailAlert: failed to send mail body chunk',
+          );
+        }
+      }
+    }
+
+    // Upload attachment files.
+    for (const file of args.attachmentFiles ?? []) {
+      try {
+        const attachment = new AttachmentBuilder(file.path, { name: file.filename });
+        await thread.send({ files: [attachment] });
+      } catch (err) {
+        log.error(
+          { err: (err as Error).message, filename: file.filename, threadId: thread.id },
+          'postMailAlert: failed to upload attachment',
+        );
       }
     }
 

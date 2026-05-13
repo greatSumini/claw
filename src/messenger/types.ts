@@ -28,6 +28,10 @@ export interface MailAlertPoster {
     channelId: string;
     threadName: string;
     initialMessage: string;
+    /** Full mail body posted as the first message inside the thread. */
+    threadFirstMessage?: string;
+    /** Local file paths uploaded as attachments in the thread. */
+    attachmentFiles?: { path: string; filename: string }[];
     /** When provided, an "이 발신자 무시" button is attached to the first message. */
     senderEmail?: string;
     senderAccount?: string;

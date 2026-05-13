@@ -11,6 +11,13 @@ export type RouteDecision =
   | { kind: 'claw-maintenance'; instructions?: string }
   | { kind: 'ignore'; reason: string };
 
+export interface MailAttachment {
+  filename: string;
+  mimeType: string;
+  attachmentId: string;
+  size: number;
+}
+
 export interface MailSummary {
   /** Recipient account email — the inbox this mail landed in. */
   account: string;
@@ -29,6 +36,8 @@ export interface MailSummary {
   snippet: string;
   /** Optional plain-text body. The classifier truncates internally. */
   bodyText?: string;
+  /** Attachments detected in the Gmail message. */
+  attachments?: MailAttachment[];
 }
 
 export type ImportanceVerdict =

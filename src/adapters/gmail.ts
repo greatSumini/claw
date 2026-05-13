@@ -7,6 +7,10 @@
  * then each subsequent poll fetches only what changed since.
  */
 
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
 import type Database from 'better-sqlite3';
 import { google, type gmail_v1 } from 'googleapis';
 
@@ -20,7 +24,7 @@ import {
   setMailState,
 } from '../state/mail.js';
 import { classifyMail } from '../orchestrator/importance.js';
-import type { ImportanceVerdict, MailSummary } from '../orchestrator/types.js';
+import type { ImportanceVerdict, MailAttachment, MailSummary } from '../orchestrator/types.js';
 import { emitEvent } from '../dashboard/event-bus.js';
 import type { MailAlertPoster } from '../messenger/types.js';
 
@@ -47,8 +51,8 @@ function makeOAuth(clientId: string, clientSecret: string) {
 
 const MAIL_ALERT_CHANNEL_NAME = 'vmc-context-hub';
 const BODY_TEXT_TRUNCATE = 4000;
-const SNIPPET_TRUNCATE = 250;
 const THREAD_NAME_MAX = 90;
+const ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024; // Discord free-tier file size limit
 
 /**
  * Decode a base64url-encoded string from the Gmail API.
@@ -197,17 +201,28 @@ function escapeDiscordMarkdown(s: string): string {
   return s.replace(/([*_~`>|\\])/g, '\\$1');
 }
 
-/** Truncate to N chars then escape, append … if cut. */
-function snippetForDiscord(snippet: string, max = SNIPPET_TRUNCATE): string {
-  const trimmed = (snippet || '').trim();
-  if (!trimmed) return '(요약 없음)';
-  const cut = trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
-  return escapeDiscordMarkdown(cut);
-}
-
 function truncateThreadName(s: string, max = THREAD_NAME_MAX): string {
   if (s.length <= max) return s;
   return s.slice(0, max - 1) + '…';
+}
+
+/** Collect attachment metadata (parts with attachmentId) from a message payload. */
+function extractAttachments(
+  payload: gmail_v1.Schema$MessagePart | undefined | null,
+): MailAttachment[] {
+  if (!payload) return [];
+  const results: MailAttachment[] = [];
+  walk(payload, (p) => {
+    if (p.body?.attachmentId && p.filename) {
+      results.push({
+        filename: p.filename,
+        mimeType: p.mimeType ?? 'application/octet-stream',
+        attachmentId: p.body.attachmentId,
+        size: p.body.size ?? 0,
+      });
+    }
+  });
+  return results;
 }
 
 export class GmailAdapter {
@@ -547,6 +562,7 @@ export class GmailAdapter {
       receivedAtIso: receivedIso,
       snippet: msg.snippet ?? '',
       bodyText: extractPlainText(msg.payload),
+      attachments: extractAttachments(msg.payload),
     };
 
     // Classify.
@@ -568,15 +584,21 @@ export class GmailAdapter {
 
     // important or ambiguous → post to Discord.
     const oneLineSummary = verdict.oneLineSummary || subject;
-    const body = this.buildAlertBody(verdict, mail);
+    const alertBody = this.buildAlertBody(verdict, mail);
+    const detailBody = this.buildDetailBody(verdict, mail);
     const threadName = truncateThreadName(`📩 ${oneLineSummary}`, THREAD_NAME_MAX);
+
+    // Download attachments to temp files (best-effort; skip on error).
+    const attachmentFiles = await this.downloadAttachments(rt, mail);
 
     let posted: { threadId: string; firstMessageId: string };
     try {
       posted = await this.poster.postMailAlert({
         channelId: this.config.mailAlertChannelId,
         threadName,
-        initialMessage: body,
+        initialMessage: alertBody,
+        threadFirstMessage: detailBody,
+        attachmentFiles,
         senderEmail: mail.fromEmail,
         senderAccount: mail.account,
       });
@@ -633,6 +655,7 @@ export class GmailAdapter {
     return { alerted: true };
   }
 
+  /** Short 2–3 line channel notification. */
   private buildAlertBody(
     verdict: Exclude<ImportanceVerdict, { kind: 'ignore' }>,
     mail: MailSummary,
@@ -640,60 +663,99 @@ export class GmailAdapter {
     const ownerUserId = this.config.env.DISCORD_OWNER_USER_ID;
     const accountLabel = this.findAccountLabel(mail.account);
     const ts = formatKst(mail.receivedAtIso);
-    const snip = snippetForDiscord(mail.snippet);
     const fromDisplay = mail.from || mail.fromEmail || '(unknown)';
-    const subject = mail.subject || '(제목 없음)';
 
     if (verdict.kind === 'important') {
-      const oneLine = verdict.oneLineSummary || subject;
-      const actionsList =
-        verdict.suggestedActions.length > 0
-          ? verdict.suggestedActions.map((a, i) => `${i + 1}. ${a}`).join('\n')
-          : '1. 내용 확인 후 답장\n2. 일정 추가\n3. 보류';
-      const contextBlock =
-        verdict.contextNotes && verdict.contextNotes.length > 0
-          ? `🧭 **맥락 메모**\n${verdict.contextNotes}\n\n`
-          : '';
-
+      const oneLine = verdict.oneLineSummary || mail.subject || '(제목 없음)';
       return [
-        `**[중요] ${oneLine}**`,
-        `<@${ownerUserId}>`,
-        '',
-        `📩 **계정**: ${accountLabel}`,
-        `👤 **발신**: ${fromDisplay}`,
-        `📅 **시각**: ${ts}`,
-        `📝 **제목**: ${subject}`,
-        '',
-        '📨 **요약**',
-        snip,
-        '',
-        `${contextBlock}🛠️ **제안 조치**`,
-        actionsList,
-        '',
+        `**[중요] ${oneLine}** <@${ownerUserId}>`,
+        `📩 ${accountLabel} | 👤 ${escapeDiscordMarkdown(fromDisplay)} | 📅 ${ts}`,
         '진행할까요? (예 / 아니오 / 다른 방향 / 이 발신자 무시)',
       ].join('\n');
     }
 
     // ambiguous
     return [
-      '**[모호] 중요·긴급 여부 확인 부탁**',
-      `<@${ownerUserId}>`,
-      '',
-      `📩 **계정**: ${accountLabel}`,
-      `👤 **발신**: ${fromDisplay}`,
-      `📅 **시각**: ${ts}`,
-      `📝 **제목**: ${subject}`,
-      '',
-      '📨 **요약**',
-      snip,
-      '',
-      `🤔 **모호한 이유**: ${verdict.reason}`,
-      '',
-      '이 메일이 중요/긴급인지 답해주세요:',
-      '[a] 중요/긴급 — 처리해주세요',
-      '[b] 정보성 — 다음부터 비슷한 거 알리지 마세요',
-      '[c] 이 발신자 앞으로 무시',
+      `**[모호] ${verdict.oneLineSummary || '중요·긴급 여부 확인 부탁'}** <@${ownerUserId}>`,
+      `📩 ${accountLabel} | 👤 ${escapeDiscordMarkdown(fromDisplay)} | 📅 ${ts}`,
+      '[a] 중요/긴급 [b] 정보성 [c] 이 발신자 무시',
     ].join('\n');
+  }
+
+  /** Full detail message posted as first thread message. */
+  private buildDetailBody(
+    verdict: Exclude<ImportanceVerdict, { kind: 'ignore' }>,
+    mail: MailSummary,
+  ): string {
+    const subject = mail.subject || '(제목 없음)';
+    const body = (mail.bodyText ?? '').trim() || '(본문 없음)';
+    const lines: string[] = [`📝 **제목**: ${subject}`];
+
+    if (verdict.kind === 'important') {
+      if (verdict.contextNotes) {
+        lines.push(`🧭 **맥락**: ${verdict.contextNotes}`);
+      }
+      const actions =
+        verdict.suggestedActions.length > 0
+          ? verdict.suggestedActions.map((a, i) => `${i + 1}. ${a}`).join(' / ')
+          : '내용 확인 후 답장';
+      lines.push(`🛠️ **제안**: ${actions}`);
+    } else {
+      lines.push(`🤔 **모호한 이유**: ${verdict.reason}`);
+    }
+
+    lines.push('', '```', body, '```');
+    return lines.join('\n');
+  }
+
+  /** Download attachments from Gmail API to a temp dir. Returns local file infos. */
+  private async downloadAttachments(
+    rt: AccountRuntime,
+    mail: MailSummary,
+  ): Promise<{ path: string; filename: string }[]> {
+    const attachments = mail.attachments ?? [];
+    if (attachments.length === 0) return [];
+
+    let tmpDir: string;
+    try {
+      tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claw-mail-'));
+    } catch (err) {
+      log.warn({ err: (err as Error).message }, 'gmail: failed to create temp dir for attachments');
+      return [];
+    }
+
+    const results: { path: string; filename: string }[] = [];
+    for (const att of attachments) {
+      if (att.size > ATTACHMENT_MAX_BYTES) {
+        log.info(
+          { filename: att.filename, size: att.size },
+          'gmail: attachment too large for Discord, skipping',
+        );
+        continue;
+      }
+      try {
+        const res = await rt.gmail.users.messages.attachments.get({
+          userId: 'me',
+          messageId: mail.messageId,
+          id: att.attachmentId,
+        });
+        const data = res.data.data ?? '';
+        const buf = Buffer.from(
+          data.replace(/-/g, '+').replace(/_/g, '/'),
+          'base64',
+        );
+        const safeName = att.filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const filePath = path.join(tmpDir, safeName);
+        await fs.writeFile(filePath, buf);
+        results.push({ path: filePath, filename: att.filename });
+      } catch (err) {
+        log.warn(
+          { filename: att.filename, err: (err as Error).message },
+          'gmail: failed to download attachment, skipping',
+        );
+      }
+    }
+    return results;
   }
 
   private findAccountLabel(email: string): string {
