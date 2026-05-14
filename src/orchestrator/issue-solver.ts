@@ -7,6 +7,8 @@
  */
 
 import { execFile } from 'node:child_process';
+import os from 'node:os';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import type Database from 'better-sqlite3';
 
@@ -184,50 +186,51 @@ export async function autoSolveIssue(opts: {
     return { success: false, error: `repo not found at ${localPath}` };
   }
 
-  // 2. Verify repo is clean
-  const { stdout: statusOut } = await execFileAsync('git', ['-C', localPath, 'status', '--porcelain']).catch(() => ({ stdout: 'ERROR' }));
-  if (statusOut.trim()) {
-    return { success: false, error: 'repo has uncommitted changes — skipping auto-solve' };
-  }
-
-  // 3. Get base branch
+  // 2. Get base branch and fetch latest
   const { stdout: branchOut } = await execFileAsync('git', ['-C', localPath, 'rev-parse', '--abbrev-ref', 'HEAD']);
   const baseBranch = branchOut.trim();
+  await execFileAsync('git', ['-C', localPath, 'fetch', 'origin', baseBranch]).catch(() => {});
 
-  // 4. Create fix branch
+  // 3. Create isolated worktree on a new branch
   const branchName = `fix/issue-${issue.number}-${slugify(issue.title)}`;
+  const worktreePath = path.join(
+    os.tmpdir(),
+    `claw-wt-${repo.fullName.replace('/', '-')}-issue-${issue.number}`,
+  );
+
   try {
-    await execFileAsync('git', ['-C', localPath, 'checkout', '-b', branchName]);
+    await execFileAsync('git', [
+      '-C', localPath, 'worktree', 'add', worktreePath, '-b', branchName, `origin/${baseBranch}`,
+    ]);
   } catch (err) {
-    return { success: false, error: `branch creation failed: ${(err as Error).message}` };
+    return { success: false, error: `worktree creation failed: ${(err as Error).message}` };
   }
 
+  let success = false;
   try {
-    // 5. Run Claude Code on the repo
+    // 4. Run Claude Code inside the isolated worktree
     updateGithubIssueAutoSolve(db, repo.fullName, issue.number, 'solving');
     const prompt = buildSolverPrompt(issue, repo);
-    const result = await runClaude({ cwd: localPath, prompt, timeoutMs: SOLVER_TIMEOUT_MS });
+    const result = await runClaude({ cwd: worktreePath, prompt, timeoutMs: SOLVER_TIMEOUT_MS });
     const summary = result.text.trim().split('\n').at(-1) ?? '';
 
-    // 6. Check for changes
-    const { stdout: afterStatus } = await execFileAsync('git', ['-C', localPath, 'status', '--porcelain']);
+    // 5. Check for changes
+    const { stdout: afterStatus } = await execFileAsync('git', ['-C', worktreePath, 'status', '--porcelain']);
     if (!afterStatus.trim()) {
-      await execFileAsync('git', ['-C', localPath, 'checkout', baseBranch]);
-      await execFileAsync('git', ['-C', localPath, 'branch', '-D', branchName]).catch(() => {});
       return { success: false, error: 'Claude made no code changes' };
     }
 
-    // 7. Commit
-    await execFileAsync('git', ['-C', localPath, 'add', '-A']);
+    // 6. Commit
+    await execFileAsync('git', ['-C', worktreePath, 'add', '-A']);
     await execFileAsync('git', [
-      '-C', localPath, 'commit',
+      '-C', worktreePath, 'commit',
       '-m', `fix: resolve issue #${issue.number} — ${issue.title.slice(0, 60)}`,
     ]);
 
-    // 8. Push
-    await execFileAsync('git', ['-C', localPath, 'push', 'origin', branchName]);
+    // 7. Push
+    await execFileAsync('git', ['-C', worktreePath, 'push', 'origin', branchName]);
 
-    // 9. Create PR
+    // 8. Create PR
     const prBody = [
       `Resolves #${issue.number}`,
       '',
@@ -258,11 +261,15 @@ export async function autoSolveIssue(opts: {
       meta: { repo: repo.fullName, issueNumber: issue.number, branchName, prUrl },
     });
 
+    success = true;
     return { success: true, prUrl, summary };
   } catch (err) {
-    // Restore branch on error
-    await execFileAsync('git', ['-C', localPath, 'checkout', baseBranch]).catch(() => {});
-    await execFileAsync('git', ['-C', localPath, 'branch', '-D', branchName]).catch(() => {});
     return { success: false, error: (err as Error).message };
+  } finally {
+    // Always remove worktree; on failure also delete the branch
+    await execFileAsync('git', ['-C', localPath, 'worktree', 'remove', worktreePath, '--force']).catch(() => {});
+    if (!success) {
+      await execFileAsync('git', ['-C', localPath, 'branch', '-D', branchName]).catch(() => {});
+    }
   }
 }
