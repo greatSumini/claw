@@ -42,6 +42,8 @@ export interface RepoEntry {
   category: 'personal' | 'code';
   description: string;
   engine?: EngineName;
+  /** Poll for new GitHub issues and post alerts to this repo's Discord channel. */
+  watchIssues?: boolean;
 }
 
 export interface GmailAccount {
@@ -77,6 +79,7 @@ const RepoEntryConfigSchema = z.object({
   category: z.enum(['personal', 'code']),
   description: z.string().default(''),
   engine: z.enum(['claude-code', 'codex']).optional(),
+  watchIssues: z.boolean().optional(),
 });
 
 const GmailAccountConfigSchema = z.object({

@@ -11,6 +11,7 @@ import { mountDashboard } from './dashboard/routes.js';
 import { GatewayIpc } from './ipc/server.js';
 import { DiscordGatewayAdapter } from './adapters/discord-gateway.js';
 import { GmailAdapter } from './adapters/gmail.js';
+import { GitHubIssueAdapter } from './adapters/github.js';
 import { RepoSyncScheduler } from './scheduler/repo-sync.js';
 import { DreamingScheduler } from './scheduler/dreaming.js';
 
@@ -77,6 +78,10 @@ async function main(): Promise<void> {
     );
   }
 
+  // GitHub Issues (polls repos where watchIssues: true)
+  const github = new GitHubIssueAdapter({ config, db, poster: discord });
+  await github.start();
+
   // Graceful shutdown
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -89,6 +94,7 @@ async function main(): Promise<void> {
       dreaming.stop();
       await discord.stop();
       if (gmail) await gmail.stop();
+      github.stop();
       await ipc.stop();
       closeDb();
     } catch (err) {

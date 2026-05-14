@@ -232,6 +232,16 @@ const MIGRATIONS: Migration[] = [
       ALTER TABLE mail_threads ADD COLUMN discord_message_id TEXT;
     `,
   },
+  {
+    name: '011_github_issue_state',
+    sql: `
+      CREATE TABLE IF NOT EXISTS github_issue_state (
+        repo               TEXT PRIMARY KEY,
+        last_issue_number  INTEGER NOT NULL DEFAULT 0,
+        last_polled_at     TEXT
+      );
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {
