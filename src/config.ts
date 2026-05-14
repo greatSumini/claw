@@ -44,6 +44,8 @@ export interface RepoEntry {
   engine?: EngineName;
   /** Poll for new GitHub issues and post alerts to this repo's Discord channel. */
   watchIssues?: boolean;
+  /** Poll for new GitHub pull requests and post alerts to this repo's Discord channel. */
+  watchPrs?: boolean;
   /** Automatically attempt to resolve simple issues via Claude Code (branch → PR). */
   autoSolveIssues?: boolean;
 }
@@ -82,6 +84,7 @@ const RepoEntryConfigSchema = z.object({
   description: z.string().default(''),
   engine: z.enum(['claude-code', 'codex']).optional(),
   watchIssues: z.boolean().optional(),
+  watchPrs: z.boolean().optional(),
   autoSolveIssues: z.boolean().optional(),
 });
 

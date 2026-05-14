@@ -1,12 +1,7 @@
 /**
- * GitHub Issues adapter — polls watched repos for new issues and creates
- * Discord threads (like Gmail alerts) so users can discuss and trigger
- * Claude Code work directly from the thread.
- *
- * If repo.autoSolveIssues is true, the adapter also:
- *   1. Classifies issue complexity (simple vs complex)
- *   2. For simple issues: branch → Claude Code → commit → push → PR
- *   3. Posts progress updates to the Discord thread throughout
+ * GitHub Issues + PRs adapter — polls watched repos for new issues/PRs and
+ * creates Discord threads. If repo.autoSolveIssues is true, simple issues are
+ * automatically resolved via Claude Code (branch → commit → push → PR).
  */
 
 import type Database from 'better-sqlite3';
@@ -20,6 +15,10 @@ import {
   getGithubIssueThreadByIssue,
   setGithubIssueThread,
   updateGithubIssueAutoSolve,
+  getGithubPrState,
+  setGithubPrState,
+  getGithubPrThreadByPr,
+  setGithubPrThread,
 } from '../state/github.js';
 import { emitEvent } from '../dashboard/event-bus.js';
 import type { MailAlertPoster } from '../messenger/types.js';
@@ -36,6 +35,19 @@ interface GitHubIssue {
   created_at: string;
   body?: string | null;
   pull_request?: unknown;
+  labels: Array<{ name: string }>;
+}
+
+interface GitHubPR {
+  number: number;
+  title: string;
+  html_url: string;
+  user: { login: string } | null;
+  created_at: string;
+  body?: string | null;
+  draft: boolean;
+  base: { ref: string };
+  head: { ref: string };
   labels: Array<{ name: string }>;
 }
 
@@ -79,7 +91,8 @@ export class GitHubIssueAdapter {
   private readonly config: AppConfig;
   private readonly db: Database.Database;
   private readonly poster: ChannelAndThreadPoster;
-  private readonly repos: RepoEntry[];
+  private readonly issueRepos: RepoEntry[];
+  private readonly prRepos: RepoEntry[];
   private readonly intervalMs: number;
 
   private timer: NodeJS.Timeout | null = null;
@@ -90,17 +103,23 @@ export class GitHubIssueAdapter {
     this.config = opts.config;
     this.db = opts.db;
     this.poster = opts.poster;
-    this.repos = opts.config.repoChannels.filter((r) => r.watchIssues);
+    this.issueRepos = opts.config.repoChannels.filter((r) => r.watchIssues);
+    this.prRepos = opts.config.repoChannels.filter((r) => r.watchPrs);
     this.intervalMs = Math.max(60_000, opts.config.env.MAIL_POLL_INTERVAL_SEC * 1000);
   }
 
   async start(): Promise<void> {
-    if (this.repos.length === 0) {
-      log.warn('github adapter: no repos configured with watchIssues — skipping');
+    const watchedCount = new Set([...this.issueRepos, ...this.prRepos]).size;
+    if (watchedCount === 0) {
+      log.warn('github adapter: no repos configured with watchIssues/watchPrs — skipping');
       return;
     }
     log.info(
-      { repos: this.repos.map((r) => r.fullName), intervalMs: this.intervalMs },
+      {
+        issueRepos: this.issueRepos.map((r) => r.fullName),
+        prRepos: this.prRepos.map((r) => r.fullName),
+        intervalMs: this.intervalMs,
+      },
       'github adapter starting',
     );
     await this.runCycle();
@@ -135,20 +154,25 @@ export class GitHubIssueAdapter {
   }
 
   private async doCycle(): Promise<void> {
-    for (const repo of this.repos) {
+    for (const repo of this.issueRepos) {
       if (this.stopped) return;
       try {
-        await this.pollRepo(repo);
+        await this.pollIssues(repo);
       } catch (err) {
-        log.error(
-          { repo: repo.fullName, err: (err as Error).message },
-          'github cycle: per-repo error',
-        );
+        log.error({ repo: repo.fullName, err: (err as Error).message }, 'github cycle: issues error');
+      }
+    }
+    for (const repo of this.prRepos) {
+      if (this.stopped) return;
+      try {
+        await this.pollPrs(repo);
+      } catch (err) {
+        log.error({ repo: repo.fullName, err: (err as Error).message }, 'github cycle: PRs error');
       }
     }
   }
 
-  private async pollRepo(repo: RepoEntry): Promise<void> {
+  private async pollIssues(repo: RepoEntry): Promise<void> {
     const state = getGithubIssueState(this.db, repo.fullName);
 
     const url = `https://api.github.com/repos/${repo.fullName}/issues?state=all&sort=created&direction=desc&per_page=20`;
@@ -330,5 +354,127 @@ export class GitHubIssueAdapter {
       log.error({ repo: repo.fullName, issue: issue.number, err: (err as Error).message }, 'tryAutoSolve: unexpected error');
       await postToThread(`❌ **자동 처리 오류**: ${(err as Error).message}`);
     }
+  }
+
+  // ---------- PR polling ----------
+
+  private async pollPrs(repo: RepoEntry): Promise<void> {
+    const state = getGithubPrState(this.db, repo.fullName);
+
+    const url = `https://api.github.com/repos/${repo.fullName}/pulls?state=all&sort=created&direction=desc&per_page=20`;
+    const resp = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${this.config.env.GH_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'claw-bot/1.0',
+      },
+    });
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      log.error({ repo: repo.fullName, status: resp.status, body }, 'github: PR API error');
+      return;
+    }
+
+    const prs = (await resp.json()) as GitHubPR[];
+
+    if (!state) {
+      const maxNum = prs.length > 0 ? Math.max(...prs.map((p) => p.number)) : 0;
+      setGithubPrState(this.db, repo.fullName, maxNum);
+      log.info({ repo: repo.fullName, maxPrNumber: maxNum }, 'github PR bootstrap complete');
+      return;
+    }
+
+    const newPrs = prs
+      .filter((p) => p.number > state.lastPrNumber)
+      .sort((a, b) => a.number - b.number);
+
+    if (newPrs.length === 0) return;
+
+    for (const pr of newPrs) {
+      if (this.stopped) break;
+      await this.postPrThread(repo, pr);
+    }
+
+    const newMax = Math.max(...newPrs.map((p) => p.number), state.lastPrNumber);
+    setGithubPrState(this.db, repo.fullName, newMax);
+
+    log.info({ repo: repo.fullName, count: newPrs.length, newMax }, 'github: new PR threads posted');
+  }
+
+  private async postPrThread(repo: RepoEntry, pr: GitHubPR): Promise<void> {
+    const existing = getGithubPrThreadByPr(this.db, repo.fullName, pr.number);
+    if (existing) {
+      log.debug({ repo: repo.fullName, pr: pr.number }, 'github: PR thread already exists, skipping');
+      return;
+    }
+
+    const author = pr.user?.login ?? '(unknown)';
+    const ts = formatKst(pr.created_at);
+    const labelStr = pr.labels.map((l) => `\`${l.name}\``).join(' ');
+    const draftTag = pr.draft ? ' `draft`' : '';
+
+    const threadName = truncateThreadName(`🔀 #${pr.number}: ${pr.title}`);
+
+    const initialMessage = [
+      `🔀 **새 PR #${pr.number}**${draftTag}: ${pr.title}`,
+      `📁 ${repo.fullName} | 👤 ${author} | 📅 ${ts} | \`${pr.head.ref}\` → \`${pr.base.ref}\`${labelStr ? ` | ${labelStr}` : ''}`,
+      pr.html_url,
+    ].join('\n');
+
+    const bodyText = (pr.body ?? '').trim() || '(본문 없음)';
+    const truncatedBody = bodyText.length > BODY_TRUNCATE
+      ? `${bodyText.slice(0, BODY_TRUNCATE)}\n…(이하 생략)`
+      : bodyText;
+
+    const threadFirstMessage = [
+      `📋 **PR #${pr.number}**: ${pr.title}`,
+      `🔗 ${pr.html_url}`,
+      `🌿 \`${pr.head.ref}\` → \`${pr.base.ref}\``,
+      '',
+      '**본문:**',
+      '```',
+      truncatedBody,
+      '```',
+    ].join('\n');
+
+    let posted: { threadId: string; firstMessageId: string };
+    try {
+      posted = await this.poster.postMailAlert({
+        channelId: repo.channelId,
+        threadName,
+        initialMessage,
+        threadFirstMessage,
+      });
+    } catch (err) {
+      log.error(
+        { repo: repo.fullName, pr: pr.number, err: (err as Error).message },
+        'github: PR discord thread post failed',
+      );
+      return;
+    }
+
+    setGithubPrThread(this.db, {
+      repo: repo.fullName,
+      prNumber: pr.number,
+      discordThreadId: posted.threadId,
+      discordMessageId: posted.firstMessageId,
+    });
+
+    logEvent(this.db, {
+      type: 'github.pr.alert',
+      channel: repo.channelName,
+      threadId: posted.threadId,
+      summary: `PR #${pr.number} ${pr.title}`,
+      meta: { repo: repo.fullName, prNumber: pr.number, author },
+    });
+    emitEvent({
+      ts: new Date().toISOString(),
+      type: 'github.pr.alert',
+      channel: repo.channelName,
+      threadId: posted.threadId,
+      summary: `PR #${pr.number} ${pr.title}`,
+    });
   }
 }

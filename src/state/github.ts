@@ -99,6 +99,93 @@ export function getGithubIssueThreadByIssue(
   };
 }
 
+// ---------- github_pr_state ----------
+
+interface GithubPrStateDbRow {
+  repo: string;
+  last_pr_number: number;
+  last_polled_at: string | null;
+}
+
+export interface GithubPrStateRow {
+  repo: string;
+  lastPrNumber: number;
+  lastPolledAt: string | null;
+}
+
+export function getGithubPrState(db: Database.Database, repo: string): GithubPrStateRow | null {
+  const stmt = db.prepare<[string], GithubPrStateDbRow>(
+    'SELECT repo, last_pr_number, last_polled_at FROM github_pr_state WHERE repo = ?',
+  );
+  const row = stmt.get(repo);
+  if (!row) return null;
+  return { repo: row.repo, lastPrNumber: row.last_pr_number, lastPolledAt: row.last_polled_at };
+}
+
+export function setGithubPrState(db: Database.Database, repo: string, lastPrNumber: number): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO github_pr_state (repo, last_pr_number, last_polled_at)
+     VALUES (@repo, @lastPrNumber, @now)
+     ON CONFLICT(repo) DO UPDATE SET
+       last_pr_number = excluded.last_pr_number,
+       last_polled_at = excluded.last_polled_at`,
+  ).run({ repo, lastPrNumber, now });
+}
+
+// ---------- github_pr_threads ----------
+
+interface GithubPrThreadDbRow {
+  repo: string;
+  pr_number: number;
+  discord_thread_id: string;
+  discord_message_id: string | null;
+  created_at: string;
+}
+
+export interface GithubPrThreadRow {
+  repo: string;
+  prNumber: number;
+  discordThreadId: string;
+  discordMessageId: string | null;
+  createdAt: string;
+}
+
+export function setGithubPrThread(db: Database.Database, args: {
+  repo: string;
+  prNumber: number;
+  discordThreadId: string;
+  discordMessageId?: string | null;
+}): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO github_pr_threads (repo, pr_number, discord_thread_id, discord_message_id, created_at)
+     VALUES (@repo, @prNumber, @discordThreadId, @discordMessageId, @now)
+     ON CONFLICT(repo, pr_number) DO NOTHING`,
+  ).run({ repo: args.repo, prNumber: args.prNumber, discordThreadId: args.discordThreadId, discordMessageId: args.discordMessageId ?? null, now });
+}
+
+export function getGithubPrThreadByPr(
+  db: Database.Database,
+  repo: string,
+  prNumber: number,
+): GithubPrThreadRow | null {
+  const stmt = db.prepare<[string, number], GithubPrThreadDbRow>(
+    'SELECT repo, pr_number, discord_thread_id, discord_message_id, created_at FROM github_pr_threads WHERE repo = ? AND pr_number = ?',
+  );
+  const row = stmt.get(repo, prNumber);
+  if (!row) return null;
+  return {
+    repo: row.repo,
+    prNumber: row.pr_number,
+    discordThreadId: row.discord_thread_id,
+    discordMessageId: row.discord_message_id,
+    createdAt: row.created_at,
+  };
+}
+
+// ---------- auto-solve ----------
+
 export type AutoSolveStatus = 'classifying' | 'solving' | 'done' | 'skipped' | 'error';
 
 export function updateGithubIssueAutoSolve(

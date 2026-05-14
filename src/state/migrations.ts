@@ -262,6 +262,25 @@ const MIGRATIONS: Migration[] = [
       ALTER TABLE github_issue_threads ADD COLUMN auto_solve_pr_url TEXT;
     `,
   },
+  {
+    name: '014_github_pr_tracking',
+    sql: `
+      CREATE TABLE IF NOT EXISTS github_pr_state (
+        repo             TEXT PRIMARY KEY,
+        last_pr_number   INTEGER NOT NULL DEFAULT 0,
+        last_polled_at   TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS github_pr_threads (
+        repo               TEXT NOT NULL,
+        pr_number          INTEGER NOT NULL,
+        discord_thread_id  TEXT NOT NULL,
+        discord_message_id TEXT,
+        created_at         TEXT NOT NULL,
+        PRIMARY KEY (repo, pr_number)
+      );
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {
