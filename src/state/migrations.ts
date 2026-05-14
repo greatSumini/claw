@@ -242,6 +242,19 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    name: '012_github_issue_threads',
+    sql: `
+      CREATE TABLE IF NOT EXISTS github_issue_threads (
+        repo               TEXT NOT NULL,
+        issue_number       INTEGER NOT NULL,
+        discord_thread_id  TEXT NOT NULL,
+        discord_message_id TEXT,
+        created_at         TEXT NOT NULL,
+        PRIMARY KEY (repo, issue_number)
+      );
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

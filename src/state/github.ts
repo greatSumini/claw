@@ -1,5 +1,7 @@
 import type Database from 'better-sqlite3';
 
+// ---------- github_issue_state ----------
+
 interface GithubIssueStateDbRow {
   repo: string;
   last_issue_number: number;
@@ -35,4 +37,64 @@ export function setGithubIssueState(db: Database.Database, repo: string, lastIss
        last_polled_at    = excluded.last_polled_at`,
   );
   stmt.run({ repo, lastIssueNumber, now });
+}
+
+// ---------- github_issue_threads ----------
+
+interface GithubIssueThreadDbRow {
+  repo: string;
+  issue_number: number;
+  discord_thread_id: string;
+  discord_message_id: string | null;
+  created_at: string;
+}
+
+export interface GithubIssueThreadRow {
+  repo: string;
+  issueNumber: number;
+  discordThreadId: string;
+  discordMessageId: string | null;
+  createdAt: string;
+}
+
+export interface SetGithubIssueThreadArgs {
+  repo: string;
+  issueNumber: number;
+  discordThreadId: string;
+  discordMessageId?: string | null;
+}
+
+export function setGithubIssueThread(db: Database.Database, args: SetGithubIssueThreadArgs): void {
+  const now = new Date().toISOString();
+  const stmt = db.prepare(
+    `INSERT INTO github_issue_threads (repo, issue_number, discord_thread_id, discord_message_id, created_at)
+     VALUES (@repo, @issueNumber, @discordThreadId, @discordMessageId, @now)
+     ON CONFLICT(repo, issue_number) DO NOTHING`,
+  );
+  stmt.run({
+    repo: args.repo,
+    issueNumber: args.issueNumber,
+    discordThreadId: args.discordThreadId,
+    discordMessageId: args.discordMessageId ?? null,
+    now,
+  });
+}
+
+export function getGithubIssueThreadByIssue(
+  db: Database.Database,
+  repo: string,
+  issueNumber: number,
+): GithubIssueThreadRow | null {
+  const stmt = db.prepare<[string, number], GithubIssueThreadDbRow>(
+    'SELECT repo, issue_number, discord_thread_id, discord_message_id, created_at FROM github_issue_threads WHERE repo = ? AND issue_number = ?',
+  );
+  const row = stmt.get(repo, issueNumber);
+  if (!row) return null;
+  return {
+    repo: row.repo,
+    issueNumber: row.issue_number,
+    discordThreadId: row.discord_thread_id,
+    discordMessageId: row.discord_message_id,
+    createdAt: row.created_at,
+  };
 }

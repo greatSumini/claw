@@ -1,6 +1,7 @@
 /**
- * GitHub Issues adapter — polls watched repos for new issues and posts
- * alerts to their corresponding Discord channels.
+ * GitHub Issues adapter — polls watched repos for new issues and creates
+ * Discord threads (like Gmail alerts) so users can discuss and trigger
+ * Claude Code work directly from the thread.
  *
  * Uses GH_TOKEN for authentication. Polls at MAIL_POLL_INTERVAL_SEC interval.
  * Bootstrap run records the current max issue number without alerting.
@@ -11,12 +12,17 @@ import type Database from 'better-sqlite3';
 import type { AppConfig, RepoEntry } from '../config.js';
 import { log } from '../log.js';
 import { logEvent } from '../state/events.js';
-import { getGithubIssueState, setGithubIssueState } from '../state/github.js';
+import {
+  getGithubIssueState,
+  setGithubIssueState,
+  getGithubIssueThreadByIssue,
+  setGithubIssueThread,
+} from '../state/github.js';
 import { emitEvent } from '../dashboard/event-bus.js';
+import type { MailAlertPoster } from '../messenger/types.js';
 
-interface ChannelPoster {
-  postToChannel(channelId: string, content: string): Promise<void>;
-}
+const THREAD_NAME_MAX = 90;
+const BODY_TRUNCATE = 3000;
 
 interface GitHubIssue {
   number: number;
@@ -24,6 +30,7 @@ interface GitHubIssue {
   html_url: string;
   user: { login: string } | null;
   created_at: string;
+  body?: string | null;
   pull_request?: unknown;
   labels: Array<{ name: string }>;
 }
@@ -31,7 +38,7 @@ interface GitHubIssue {
 interface GitHubIssueAdapterOpts {
   config: AppConfig;
   db: Database.Database;
-  poster: ChannelPoster;
+  poster: MailAlertPoster;
 }
 
 function formatKst(iso: string): string {
@@ -55,10 +62,15 @@ function formatKst(iso: string): string {
   return `${out} KST`;
 }
 
+function truncateThreadName(s: string, max = THREAD_NAME_MAX): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + '…';
+}
+
 export class GitHubIssueAdapter {
   private readonly config: AppConfig;
   private readonly db: Database.Database;
-  private readonly poster: ChannelPoster;
+  private readonly poster: MailAlertPoster;
   private readonly repos: RepoEntry[];
   private readonly intervalMs: number;
 
@@ -166,7 +178,7 @@ export class GitHubIssueAdapter {
 
     for (const issue of newIssues) {
       if (this.stopped) break;
-      await this.postIssueAlert(repo, issue);
+      await this.postIssueThread(repo, issue);
     }
 
     const newMax = Math.max(...newIssues.map((i) => i.number), state.lastIssueNumber);
@@ -174,26 +186,64 @@ export class GitHubIssueAdapter {
 
     log.info(
       { repo: repo.fullName, count: newIssues.length, newMax },
-      'github: new issues posted',
+      'github: new issue threads posted',
     );
   }
 
-  private async postIssueAlert(repo: RepoEntry, issue: GitHubIssue): Promise<void> {
+  private async postIssueThread(repo: RepoEntry, issue: GitHubIssue): Promise<void> {
+    // Idempotency: skip if thread already exists for this issue.
+    const existing = getGithubIssueThreadByIssue(this.db, repo.fullName, issue.number);
+    if (existing) {
+      log.debug({ repo: repo.fullName, issue: issue.number }, 'github: thread already exists, skipping');
+      return;
+    }
+
     const author = issue.user?.login ?? '(unknown)';
     const ts = formatKst(issue.created_at);
     const labelStr = issue.labels.map((l) => `\`${l.name}\``).join(' ');
 
-    const lines = [
+    const threadName = truncateThreadName(`🐛 #${issue.number}: ${issue.title}`);
+
+    const initialMessage = [
       `🐛 **새 이슈 #${issue.number}**: ${issue.title}`,
       `📁 ${repo.fullName} | 👤 ${author} | 📅 ${ts}${labelStr ? ` | ${labelStr}` : ''}`,
       issue.html_url,
-    ];
+    ].join('\n');
+
+    const bodyText = (issue.body ?? '').trim() || '(본문 없음)';
+    const truncatedBody = bodyText.length > BODY_TRUNCATE
+      ? `${bodyText.slice(0, BODY_TRUNCATE)}\n…(이하 생략)`
+      : bodyText;
+
+    const threadFirstMessage = [
+      `📋 **이슈 #${issue.number}**: ${issue.title}`,
+      `🔗 ${issue.html_url}`,
+      '',
+      '**본문:**',
+      '```',
+      truncatedBody,
+      '```',
+    ].join('\n');
 
     try {
-      await this.poster.postToChannel(repo.channelId, lines.join('\n'));
+      const posted = await this.poster.postMailAlert({
+        channelId: repo.channelId,
+        threadName,
+        initialMessage,
+        threadFirstMessage,
+      });
+
+      setGithubIssueThread(this.db, {
+        repo: repo.fullName,
+        issueNumber: issue.number,
+        discordThreadId: posted.threadId,
+        discordMessageId: posted.firstMessageId,
+      });
+
       logEvent(this.db, {
         type: 'github.issue.alert',
         channel: repo.channelName,
+        threadId: posted.threadId,
         summary: `#${issue.number} ${issue.title}`,
         meta: { repo: repo.fullName, issueNumber: issue.number, author },
       });
@@ -201,12 +251,13 @@ export class GitHubIssueAdapter {
         ts: new Date().toISOString(),
         type: 'github.issue.alert',
         channel: repo.channelName,
+        threadId: posted.threadId,
         summary: `#${issue.number} ${issue.title}`,
       });
     } catch (err) {
       log.error(
         { repo: repo.fullName, issue: issue.number, err: (err as Error).message },
-        'github: discord post failed',
+        'github: discord thread post failed',
       );
     }
   }
