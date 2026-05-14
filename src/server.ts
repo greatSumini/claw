@@ -1,12 +1,15 @@
 import 'dotenv/config';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import express from 'express';
 import fs from 'node:fs';
 
 import { loadConfig } from './config.js';
 import { log } from './log.js';
 import { getDb, closeDb } from './state/db.js';
+import { logEvent } from './state/events.js';
 import { mountDashboard } from './dashboard/routes.js';
 import { GatewayIpc } from './ipc/server.js';
 import { DiscordGatewayAdapter } from './adapters/discord-gateway.js';
@@ -16,21 +19,51 @@ import { RepoSyncScheduler } from './scheduler/repo-sync.js';
 import { DreamingScheduler } from './scheduler/dreaming.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const execFileAsync = promisify(execFile);
+
+async function getGitCommit(cwd: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', '--short', 'HEAD'], { cwd });
+    return stdout.trim();
+  } catch {
+    return 'unknown';
+  }
+}
+
+function formatKst(iso: string): string {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Seoul',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+  return fmt.format(new Date(iso)).replace(', ', ' ').replace(',', ' ') + ' KST';
+}
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  const startedAt = new Date().toISOString();
+  const commitHash = await getGitCommit(process.cwd());
 
   fs.mkdirSync(config.paths.dataDir, { recursive: true });
   fs.mkdirSync(config.paths.logsDir, { recursive: true });
 
-  log.info({ pid: process.pid, dbFile: config.paths.dbFile, repos: config.repoChannels.length }, 'claw gateway starting');
+  log.info({ pid: process.pid, commit: commitHash, dbFile: config.paths.dbFile, repos: config.repoChannels.length }, 'claw gateway starting');
 
   const db = getDb(config.paths.dbFile);
+
+  const gmailCount = config.gmail.length;
+  const githubCount = config.repoChannels.filter((r) => r.watchIssues).length;
 
   // Express app + dashboard
   const app = express();
   app.get('/healthz', (_req, res) => {
-    res.json({ ok: true, ts: new Date().toISOString() });
+    res.json({
+      ok: true,
+      ts: new Date().toISOString(),
+      commit: commitHash,
+      startedAt,
+      adapters: { gmail: gmailCount, github: githubCount },
+    });
   });
   mountDashboard(app, { db, secret: config.env.DASHBOARD_SECRET });
   const server = app.listen(config.env.DASHBOARD_PORT, () => {
@@ -82,6 +115,23 @@ async function main(): Promise<void> {
   const github = new GitHubIssueAdapter({ config, db, poster: discord });
   await github.start();
 
+  // Startup notification — visible in Discord so stale-gateway issues are immediately detectable
+  const startupMsg = [
+    `🔄 **gateway 재기동** | commit: \`${commitHash}\` | ${formatKst(startedAt)}`,
+    `📦 gmail: ${gmailCount}계정 | github: ${githubCount} repo`,
+  ].join('\n');
+  try {
+    await discord.postToChannel(config.clawChannelId, startupMsg);
+  } catch (err) {
+    log.warn({ err: (err as Error).message }, 'startup notification failed');
+  }
+  logEvent(db, {
+    type: 'gateway.start',
+    channel: 'claw',
+    summary: `commit: ${commitHash} | gmail:${gmailCount} github:${githubCount}`,
+    meta: { commit: commitHash, startedAt, gmail: gmailCount, github: githubCount },
+  });
+
   // Graceful shutdown
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -109,7 +159,7 @@ async function main(): Promise<void> {
     void shutdown('uncaughtException');
   });
 
-  log.info('claw gateway running');
+  log.info({ commit: commitHash }, 'claw gateway running');
 }
 
 main().catch((err) => {
