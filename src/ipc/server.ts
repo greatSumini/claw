@@ -133,10 +133,12 @@ export class GatewayIpc extends EventEmitter {
       this.workerSocket = null;
       this.workerReady = false;
       if (this.draining) {
-        // Intentional drain exit — respawn updated worker
-        console.log('[gateway-ipc] drain complete, spawning updated worker');
+        // Intentional drain exit — restart gateway so launchd respawns with updated code.
+        // SIGTERM triggers the graceful shutdown handler in server.ts; launchd KeepAlive
+        // restarts the whole gateway (server.js + fresh worker) with the latest dist/.
+        console.log('[gateway-ipc] drain complete, sending SIGTERM to gateway for full restart');
         this.draining = false;
-        setImmediate(() => this.spawnWorker());
+        process.kill(process.pid, 'SIGTERM');
       } else if (code !== 0 || signal != null) {
         // Crash — respawn after short delay
         console.warn(`[gateway-ipc] worker crashed, respawning in 2s`);
