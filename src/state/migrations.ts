@@ -255,6 +255,13 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    name: '013_github_issue_auto_solve',
+    sql: `
+      ALTER TABLE github_issue_threads ADD COLUMN auto_solve_status TEXT;
+      ALTER TABLE github_issue_threads ADD COLUMN auto_solve_pr_url TEXT;
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

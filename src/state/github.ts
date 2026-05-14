@@ -98,3 +98,20 @@ export function getGithubIssueThreadByIssue(
     createdAt: row.created_at,
   };
 }
+
+export type AutoSolveStatus = 'classifying' | 'solving' | 'done' | 'skipped' | 'error';
+
+export function updateGithubIssueAutoSolve(
+  db: Database.Database,
+  repo: string,
+  issueNumber: number,
+  status: AutoSolveStatus,
+  prUrl?: string | null,
+): void {
+  const stmt = db.prepare(
+    `UPDATE github_issue_threads
+     SET auto_solve_status = @status, auto_solve_pr_url = @prUrl
+     WHERE repo = @repo AND issue_number = @issueNumber`,
+  );
+  stmt.run({ repo, issueNumber, status, prUrl: prUrl ?? null });
+}

@@ -3,8 +3,10 @@
  * Discord threads (like Gmail alerts) so users can discuss and trigger
  * Claude Code work directly from the thread.
  *
- * Uses GH_TOKEN for authentication. Polls at MAIL_POLL_INTERVAL_SEC interval.
- * Bootstrap run records the current max issue number without alerting.
+ * If repo.autoSolveIssues is true, the adapter also:
+ *   1. Classifies issue complexity (simple vs complex)
+ *   2. For simple issues: branch → Claude Code → commit → push → PR
+ *   3. Posts progress updates to the Discord thread throughout
  */
 
 import type Database from 'better-sqlite3';
@@ -17,9 +19,11 @@ import {
   setGithubIssueState,
   getGithubIssueThreadByIssue,
   setGithubIssueThread,
+  updateGithubIssueAutoSolve,
 } from '../state/github.js';
 import { emitEvent } from '../dashboard/event-bus.js';
 import type { MailAlertPoster } from '../messenger/types.js';
+import { classifyIssueComplexity, autoSolveIssue, type IssueInfo } from '../orchestrator/issue-solver.js';
 
 const THREAD_NAME_MAX = 90;
 const BODY_TRUNCATE = 3000;
@@ -35,10 +39,14 @@ interface GitHubIssue {
   labels: Array<{ name: string }>;
 }
 
+interface ChannelAndThreadPoster extends MailAlertPoster {
+  postToChannel(channelId: string, content: string): Promise<void>;
+}
+
 interface GitHubIssueAdapterOpts {
   config: AppConfig;
   db: Database.Database;
-  poster: MailAlertPoster;
+  poster: ChannelAndThreadPoster;
 }
 
 function formatKst(iso: string): string {
@@ -70,7 +78,7 @@ function truncateThreadName(s: string, max = THREAD_NAME_MAX): string {
 export class GitHubIssueAdapter {
   private readonly config: AppConfig;
   private readonly db: Database.Database;
-  private readonly poster: MailAlertPoster;
+  private readonly poster: ChannelAndThreadPoster;
   private readonly repos: RepoEntry[];
   private readonly intervalMs: number;
 
@@ -169,7 +177,7 @@ export class GitHubIssueAdapter {
       return;
     }
 
-    // Filter PRs out (GitHub issues endpoint includes PRs) and find new ones.
+    // Filter PRs out and find new issues.
     const newIssues = issues
       .filter((i) => !i.pull_request && i.number > state.lastIssueNumber)
       .sort((a, b) => a.number - b.number); // oldest first
@@ -225,40 +233,102 @@ export class GitHubIssueAdapter {
       '```',
     ].join('\n');
 
+    let posted: { threadId: string; firstMessageId: string };
     try {
-      const posted = await this.poster.postMailAlert({
+      posted = await this.poster.postMailAlert({
         channelId: repo.channelId,
         threadName,
         initialMessage,
         threadFirstMessage,
-      });
-
-      setGithubIssueThread(this.db, {
-        repo: repo.fullName,
-        issueNumber: issue.number,
-        discordThreadId: posted.threadId,
-        discordMessageId: posted.firstMessageId,
-      });
-
-      logEvent(this.db, {
-        type: 'github.issue.alert',
-        channel: repo.channelName,
-        threadId: posted.threadId,
-        summary: `#${issue.number} ${issue.title}`,
-        meta: { repo: repo.fullName, issueNumber: issue.number, author },
-      });
-      emitEvent({
-        ts: new Date().toISOString(),
-        type: 'github.issue.alert',
-        channel: repo.channelName,
-        threadId: posted.threadId,
-        summary: `#${issue.number} ${issue.title}`,
       });
     } catch (err) {
       log.error(
         { repo: repo.fullName, issue: issue.number, err: (err as Error).message },
         'github: discord thread post failed',
       );
+      return;
+    }
+
+    setGithubIssueThread(this.db, {
+      repo: repo.fullName,
+      issueNumber: issue.number,
+      discordThreadId: posted.threadId,
+      discordMessageId: posted.firstMessageId,
+    });
+
+    logEvent(this.db, {
+      type: 'github.issue.alert',
+      channel: repo.channelName,
+      threadId: posted.threadId,
+      summary: `#${issue.number} ${issue.title}`,
+      meta: { repo: repo.fullName, issueNumber: issue.number, author },
+    });
+    emitEvent({
+      ts: new Date().toISOString(),
+      type: 'github.issue.alert',
+      channel: repo.channelName,
+      threadId: posted.threadId,
+      summary: `#${issue.number} ${issue.title}`,
+    });
+
+    // Auto-solve: fire-and-forget (non-blocking so polling continues)
+    if (repo.autoSolveIssues) {
+      const issueInfo: IssueInfo = {
+        number: issue.number,
+        title: issue.title,
+        body: issue.body ?? null,
+        htmlUrl: issue.html_url,
+      };
+      setImmediate(() => void this.tryAutoSolve(repo, issueInfo, posted.threadId));
+    }
+  }
+
+  private async tryAutoSolve(
+    repo: RepoEntry,
+    issue: IssueInfo,
+    threadId: string,
+  ): Promise<void> {
+    const postToThread = (msg: string) =>
+      this.poster.postToChannel(threadId, msg).catch((err) =>
+        log.warn({ threadId, err: (err as Error).message }, 'github: thread post failed'),
+      );
+
+    try {
+      // 1. Classify complexity
+      updateGithubIssueAutoSolve(this.db, repo.fullName, issue.number, 'classifying');
+      await postToThread('🤖 **복잡도 분석 중...**');
+
+      const { verdict, reason } = await classifyIssueComplexity(issue, this.config);
+      log.info({ repo: repo.fullName, issue: issue.number, verdict, reason }, 'issue classified');
+
+      if (verdict === 'complex') {
+        updateGithubIssueAutoSolve(this.db, repo.fullName, issue.number, 'skipped');
+        await postToThread(`🧠 **복잡도: 높음** — 수동 처리 필요\n> ${reason}`);
+        return;
+      }
+
+      // 2. Auto-solve
+      await postToThread(`✅ **복잡도: 낮음** — 자동 처리 시작\n> ${reason}`);
+      updateGithubIssueAutoSolve(this.db, repo.fullName, issue.number, 'solving');
+      await postToThread('⚙️ **branch 생성 → Claude Code 실행 중...** (최대 15분 소요)');
+
+      const result = await autoSolveIssue({ repo, issue, db: this.db, config: this.config });
+
+      if (result.success && result.prUrl) {
+        updateGithubIssueAutoSolve(this.db, repo.fullName, issue.number, 'done', result.prUrl);
+        await postToThread([
+          `🎉 **PR 생성 완료**`,
+          `🔗 ${result.prUrl}`,
+          result.summary ? `📝 ${result.summary}` : '',
+        ].filter(Boolean).join('\n'));
+      } else {
+        updateGithubIssueAutoSolve(this.db, repo.fullName, issue.number, 'error');
+        await postToThread(`❌ **자동 처리 실패**: ${result.error ?? '알 수 없는 오류'}`);
+      }
+    } catch (err) {
+      updateGithubIssueAutoSolve(this.db, repo.fullName, issue.number, 'error');
+      log.error({ repo: repo.fullName, issue: issue.number, err: (err as Error).message }, 'tryAutoSolve: unexpected error');
+      await postToThread(`❌ **자동 처리 오류**: ${(err as Error).message}`);
     }
   }
 }
