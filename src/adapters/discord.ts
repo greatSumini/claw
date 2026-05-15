@@ -6,7 +6,7 @@ import type Database from 'better-sqlite3';
 
 import type { AppConfig, RepoEntry } from '../config.js';
 import { log } from '../log.js';
-import { runClaude, ClaudeError } from '../claude.js';
+import { runClaude, ClaudeError, snapshotSessionFiles, restoreSessionFiles } from '../claude.js';
 import { runCodex } from '../codex.js';
 import { getSession, upsertSession } from '../state/sessions.js';
 import { logEvent, searchEvents, type EventSearchResult } from '../state/events.js';
@@ -585,6 +585,7 @@ export class DiscordAdapter implements MessengerAdapter {
     threadContext?: string,
   ): Promise<void> {
     const channelLabel = ctx.channelName ?? ctx.channelId;
+    const isBtw = ctx.text.trimStart().startsWith('(btw)');
 
     // Look up existing claude session.
     const sessionRow = getSession(this.db, threadKey);
@@ -640,6 +641,9 @@ export class DiscordAdapter implements MessengerAdapter {
         threadId: threadKey,
         summary: `repo=${repo.fullName} resume=${Boolean(resumeId)}`,
       });
+
+      // For (btw) messages: snapshot session files before running so we can roll back after.
+      const btwSnapshot = isBtw ? await snapshotSessionFiles(repo.localPath) : undefined;
 
       let result;
       try {
@@ -724,31 +728,42 @@ export class DiscordAdapter implements MessengerAdapter {
         }
       }
 
-      // Persist session.
-      try {
-        upsertSession(this.db, {
-          threadId: threadKey,
-          claudeSessionId: result.sessionId,
-          repo: repo.fullName,
-          cwd: repo.localPath,
-          lastSkill: skillResult.skill,
-          lastResponse: truncateForCache(result.text),
-        });
-      } catch (err) {
-        log.error(
-          { err: (err as Error).message, threadId: threadKey },
-          'failed to upsert session',
+      // (btw) mode: restore session files to pre-run state so this exchange is ephemeral.
+      if (isBtw && btwSnapshot) {
+        await restoreSessionFiles(repo.localPath, btwSnapshot).catch((err: Error) =>
+          log.warn({ err: err.message, threadId: threadKey }, 'btw: session restore failed'),
         );
       }
 
-      // Fire-and-forget fact extraction (non-blocking, best-effort).
-      extractAndSaveFacts(
-        this.db,
-        this.config.clawRepoPath,
-        repoScope(repo.fullName),
-        ctx.text,
-        result.text,
-      ).catch((err: Error) => log.debug({ err: err.message }, 'fact-extractor: skipped'));
+      // Persist session — skip for (btw) so the context pointer stays at the pre-btw state.
+      if (!isBtw) {
+        try {
+          upsertSession(this.db, {
+            threadId: threadKey,
+            claudeSessionId: result.sessionId,
+            repo: repo.fullName,
+            cwd: repo.localPath,
+            lastSkill: skillResult.skill,
+            lastResponse: truncateForCache(result.text),
+          });
+        } catch (err) {
+          log.error(
+            { err: (err as Error).message, threadId: threadKey },
+            'failed to upsert session',
+          );
+        }
+      }
+
+      // Fire-and-forget fact extraction (non-blocking, best-effort) — skip for (btw).
+      if (!isBtw) {
+        extractAndSaveFacts(
+          this.db,
+          this.config.clawRepoPath,
+          repoScope(repo.fullName),
+          ctx.text,
+          result.text,
+        ).catch((err: Error) => log.debug({ err: err.message }, 'fact-extractor: skipped'));
+      }
 
       // Result + outbound logs.
       logEvent(this.db, {

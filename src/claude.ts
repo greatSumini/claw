@@ -181,11 +181,56 @@ function extractAssistantText(obj: StreamJsonObject): string {
   return '';
 }
 
+function sessionDir(cwd: string): string {
+  const encoded = cwd.replace(/\//g, '-');
+  return path.join(os.homedir(), '.claude', 'projects', encoded);
+}
+
+/** Snapshot the byte-size of every .jsonl file in the session dir. */
+export async function snapshotSessionFiles(cwd: string): Promise<Map<string, number>> {
+  const dir = sessionDir(cwd);
+  const snapshot = new Map<string, number>();
+  const entries = await fs.readdir(dir).catch(() => [] as string[]);
+  for (const entry of entries) {
+    if (!entry.endsWith('.jsonl')) continue;
+    const stat = await fs.stat(path.join(dir, entry)).catch(() => null);
+    if (stat) snapshot.set(entry, stat.size);
+  }
+  return snapshot;
+}
+
+/**
+ * Restore session files to their pre-snapshot state.
+ * New files are deleted; files that grew are truncated back.
+ */
+export async function restoreSessionFiles(
+  cwd: string,
+  snapshot: Map<string, number>,
+): Promise<void> {
+  const dir = sessionDir(cwd);
+  const entries = await fs.readdir(dir).catch(() => [] as string[]);
+  for (const entry of entries) {
+    if (!entry.endsWith('.jsonl')) continue;
+    const filePath = path.join(dir, entry);
+    if (!snapshot.has(entry)) {
+      await fs
+        .unlink(filePath)
+        .catch((err: Error) => log.warn({ err: err.message }, 'btw: delete session file failed'));
+    } else {
+      const origSize = snapshot.get(entry)!;
+      const stat = await fs.stat(filePath).catch(() => null);
+      if (stat && stat.size > origSize) {
+        const fd = await fs.open(filePath, 'r+');
+        await fd.truncate(origSize).finally(() => fd.close());
+      }
+    }
+  }
+}
+
 async function lookupLatestSessionId(cwd: string): Promise<string> {
   // Encoding: claude stores sessions in ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
   // Encoded cwd: replace '/' with '-'. An absolute path like /Users/sumin becomes -Users-sumin.
-  const encoded = cwd.replace(/\//g, '-');
-  const dir = path.join(os.homedir(), '.claude', 'projects', encoded);
+  const dir = sessionDir(cwd);
   const entries = await fs.readdir(dir).catch(() => [] as string[]);
   const jsonl = entries.filter((e) => e.endsWith('.jsonl'));
   if (jsonl.length === 0) {
