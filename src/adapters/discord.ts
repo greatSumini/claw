@@ -8,6 +8,7 @@ import type { AppConfig, RepoEntry } from '../config.js';
 import { log } from '../log.js';
 import { runClaude, ClaudeError, snapshotSessionFiles, restoreSessionFiles } from '../claude.js';
 import { runCodex } from '../codex.js';
+import { tmuxRunner, TmuxError } from '../tmux-runner.js';
 import { getSession, upsertSession } from '../state/sessions.js';
 import { logEvent, searchEvents, type EventSearchResult } from '../state/events.js';
 import { emitEvent } from '../dashboard/event-bus.js';
@@ -647,16 +648,33 @@ export class DiscordAdapter implements MessengerAdapter {
 
       let result;
       try {
-        const runner = repo.engine === 'codex' ? runCodex : runClaude;
-        result = await runner({
-          cwd: repo.localPath,
-          prompt: userMessage,
-          systemAppend,
-          resume: resumeId,
-          timeoutMs: CLAUDE_TIMEOUT_MS,
-        });
+        if (repo.engine === 'tmux') {
+          const tmuxResult = await tmuxRunner.run({
+            cwd: repo.localPath,
+            prompt: userMessage,
+            systemAppend,
+            sessionKey: threadKey,
+            timeoutMs: CLAUDE_TIMEOUT_MS,
+          });
+          result = {
+            text: tmuxResult.text,
+            sessionId: tmuxResult.sessionKey,
+            durationMs: tmuxResult.durationMs,
+            exitCode: tmuxResult.exitCode,
+            artifacts: tmuxResult.artifacts,
+          };
+        } else {
+          const runner = repo.engine === 'codex' ? runCodex : runClaude;
+          result = await runner({
+            cwd: repo.localPath,
+            prompt: userMessage,
+            systemAppend,
+            resume: resumeId,
+            timeoutMs: CLAUDE_TIMEOUT_MS,
+          });
+        }
       } catch (err) {
-        const e = err instanceof ClaudeError ? err : (err as Error);
+        const e = err instanceof ClaudeError || err instanceof TmuxError ? err : (err as Error);
         log.error(
           { err: e.message, channel: channelLabel, threadId: threadKey, repo: repo.fullName },
           'engine run failed in repo-work',

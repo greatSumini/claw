@@ -32,7 +32,7 @@ const Schema = z.object({
 
 export type Env = z.infer<typeof Schema>;
 
-export type EngineName = 'claude-code' | 'codex';
+export type EngineName = 'claude-code' | 'codex' | 'tmux';
 
 export interface RepoEntry {
   channelName: string;
@@ -82,7 +82,7 @@ const RepoEntryConfigSchema = z.object({
   localPath: z.string().min(1),
   category: z.enum(['personal', 'code']),
   description: z.string().default(''),
-  engine: z.enum(['claude-code', 'codex']).optional(),
+  engine: z.enum(['claude-code', 'codex', 'tmux']).optional(),
   watchIssues: z.boolean().optional(),
   watchPrs: z.boolean().optional(),
   autoSolveIssues: z.boolean().optional(),
