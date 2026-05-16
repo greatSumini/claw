@@ -5,6 +5,7 @@ import {
   sanitizeSessionName,
   stripAnsi,
   extractResponse,
+  cleanupPaneText,
   TmuxRunner,
   TmuxError,
   type CmdRunner,
@@ -93,6 +94,268 @@ describe('extractResponse', () => {
     const result = extractResponse(before, after, 'anchor');
     assert.equal(result, 'response');
   });
+});
+
+// ── Realistic Claude Code TUI fixtures ────────────────────────────────────
+//
+// These fixtures model the plain-text output of `tmux capture-pane -p -J`
+// after ANSI codes are stripped.  Adjust as real pane captures are collected.
+//
+// How to capture a real fixture:
+//   tmux capture-pane -t <session-name> -p -J -S -3000 > fixture.txt
+// Then add it as a new FIXTURES entry below.
+
+/** Simulated Claude Code TUI pane content (terminal width ~80). */
+const FIXTURES = {
+  // Fresh session: only the input box, no conversation yet.
+  empty: [
+    '╭──────────────────────────────────────────────────────────────────────────────╮',
+    '│ >                                                                            │',
+    '╰──────────────────────────────────────────────────────────────────────────────╯',
+  ].join('\n'),
+
+  // After user sends "What is 2+2?" and Claude responds "4".
+  simpleQA: (prompt = 'What is 2+2?', response = '4') =>
+    [
+      '╭──────────────────────────────────────────────────────────────────────────────╮',
+      '│ ● Loaded MCP server "filesystem"                                            │',
+      '╰──────────────────────────────────────────────────────────────────────────────╯',
+      '',
+      ' ◈ Human',
+      '',
+      `   ${prompt}`,
+      '',
+      ' ◈ Claude',
+      '',
+      `   ${response}`,
+      '',
+      '╭──────────────────────────────────────────────────────────────────────────────╮',
+      '│ >                                                                            │',
+      '╰──────────────────────────────────────────────────────────────────────────────╯',
+    ].join('\n'),
+
+  // After a multi-line response.
+  multiLineResponse: [
+    ' ◈ Human',
+    '',
+    '   Please list 3 colors',
+    '',
+    ' ◈ Claude',
+    '',
+    '   1. Red',
+    '   2. Green',
+    '   3. Blue',
+    '',
+    '╭──────────────────────────────────────────────────────────────────────────────╮',
+    '│ >                                                                            │',
+    '╰──────────────────────────────────────────────────────────────────────────────╯',
+  ].join('\n'),
+
+  // After a response containing a code block.
+  codeBlock: [
+    ' ◈ Human',
+    '',
+    '   Show me a hello world in Python',
+    '',
+    ' ◈ Claude',
+    '',
+    '   Sure! Here is a hello world in Python:',
+    '',
+    '   ```python',
+    '   print("Hello, world!")',
+    '   ```',
+    '',
+    '╭──────────────────────────────────────────────────────────────────────────────╮',
+    '│ >                                                                            │',
+    '╰──────────────────────────────────────────────────────────────────────────────╯',
+  ].join('\n'),
+
+  // After a continuation message ("this is a follow-up").
+  continuation: [
+    ' ◈ Human',
+    '',
+    '   What is 2+2?',
+    '',
+    ' ◈ Claude',
+    '',
+    '   4',
+    '',
+    ' ◈ Human',
+    '',
+    '   And 3+3?',
+    '',
+    ' ◈ Claude',
+    '',
+    '   6',
+    '',
+    '╭──────────────────────────────────────────────────────────────────────────────╮',
+    '│ >                                                                            │',
+    '╰──────────────────────────────────────────────────────────────────────────────╯',
+  ].join('\n'),
+};
+
+// ── Table-driven tests: extractResponse with TUI fixtures ─────────────────
+
+interface ExtractCase {
+  label: string;
+  before: string;
+  after: string;
+  prompt: string;
+  shouldContain: string[];
+  shouldNotContain?: string[];
+}
+
+const extractCases: ExtractCase[] = [
+  {
+    label: 'simple Q&A — anchor strategy picks up response after prompt',
+    before: FIXTURES.empty,
+    after: FIXTURES.simpleQA(),
+    prompt: 'What is 2+2?',
+    shouldContain: ['4'],
+    shouldNotContain: ['What is 2+2?'],
+  },
+  {
+    label: 'multi-line response — all lines present',
+    before: FIXTURES.empty,
+    after: FIXTURES.multiLineResponse,
+    prompt: 'Please list 3 colors',
+    shouldContain: ['1. Red', '2. Green', '3. Blue'],
+  },
+  {
+    label: 'code block — backticks and code preserved',
+    before: FIXTURES.empty,
+    after: FIXTURES.codeBlock,
+    prompt: 'Show me a hello world in Python',
+    shouldContain: ['print("Hello, world!")', '```python'],
+  },
+  {
+    label: 'continuation — lastIndexOf picks latest occurrence of anchor',
+    before: FIXTURES.simpleQA(),
+    after: FIXTURES.continuation,
+    prompt: 'And 3+3?',
+    shouldContain: ['6'],
+    shouldNotContain: ['And 3+3?'],
+  },
+  {
+    label: 'anchor not found — line diff fallback captures new lines',
+    before: FIXTURES.empty,
+    after: FIXTURES.simpleQA('totally different prompt', 'response text'),
+    // prompt doesn't match what's in pane → triggers line diff
+    prompt: 'anchor not present in pane at all XYZ',
+    shouldContain: ['response text'],
+  },
+];
+
+describe('extractResponse — table-driven with TUI fixtures', () => {
+  for (const tc of extractCases) {
+    test(tc.label, () => {
+      const result = extractResponse(tc.before, tc.after, tc.prompt);
+      for (const s of tc.shouldContain) {
+        assert.ok(result.includes(s), `expected "${s}" in result:\n${result}`);
+      }
+      for (const s of tc.shouldNotContain ?? []) {
+        assert.ok(!result.includes(s), `did NOT expect "${s}" in result:\n${result}`);
+      }
+    });
+  }
+});
+
+// ── cleanupPaneText ────────────────────────────────────────────────────────
+
+interface CleanupCase {
+  label: string;
+  input: string;
+  shouldContain: string[];
+  shouldNotContain: string[];
+}
+
+const cleanupCases: CleanupCase[] = [
+  {
+    label: 'removes box drawing border lines',
+    input: [
+      '╭──────────────────╮',
+      '│ response text    │',
+      '╰──────────────────╯',
+    ].join('\n'),
+    shouldContain: ['response text'],
+    shouldNotContain: ['╭', '╰', '──────'],
+  },
+  {
+    label: 'removes ◈ Claude role indicator',
+    input: ' ◈ Claude\n\n   Hello there!',
+    shouldContain: ['Hello there!'],
+    shouldNotContain: ['◈ Claude'],
+  },
+  {
+    label: 'removes ● Claude role indicator',
+    input: ' ● Claude\n   Hello!',
+    shouldContain: ['Hello!'],
+    shouldNotContain: ['● Claude'],
+  },
+  {
+    label: 'removes ◈ Human role indicator',
+    input: ' ◈ Human\n   User message\n ◈ Claude\n   Response',
+    shouldContain: ['User message', 'Response'],
+    shouldNotContain: ['◈ Human', '◈ Claude'],
+  },
+  {
+    label: 'removes input box │ > │',
+    input: 'Response content\n│ >                │',
+    shouldContain: ['Response content'],
+    shouldNotContain: ['│ >'],
+  },
+  {
+    label: 'removes standalone > indicator',
+    input: 'Response\n >',
+    shouldContain: ['Response'],
+    shouldNotContain: ['>'],
+  },
+  {
+    label: 'preserves code blocks and special content',
+    input: [
+      ' ◈ Claude',
+      '',
+      '   Here is the code:',
+      '',
+      '   ```python',
+      '   print("Hello, world!")',
+      '   ```',
+    ].join('\n'),
+    shouldContain: ['Here is the code:', 'print("Hello, world!")', '```python'],
+    shouldNotContain: ['◈ Claude'],
+  },
+  {
+    label: 'trims trailing spaces per line (TUI pads to terminal width)',
+    input: 'Hello world                    ',
+    shouldContain: ['Hello world'],
+    shouldNotContain: ['Hello world   '],
+  },
+  {
+    label: 'full TUI pane — only response text survives',
+    input: extractResponse(FIXTURES.empty, FIXTURES.simpleQA(), 'What is 2+2?'),
+    shouldContain: ['4'],
+    shouldNotContain: ['╭', '╰', '◈ Claude', '◈ Human', '│ >'],
+  },
+  {
+    label: 'multi-line response — all content lines preserved',
+    input: extractResponse(FIXTURES.empty, FIXTURES.multiLineResponse, 'Please list 3 colors'),
+    shouldContain: ['1. Red', '2. Green', '3. Blue'],
+    shouldNotContain: ['◈ Claude', '◈ Human', '╭', '│ >'],
+  },
+];
+
+describe('cleanupPaneText — table-driven', () => {
+  for (const tc of cleanupCases) {
+    test(tc.label, () => {
+      const result = cleanupPaneText(tc.input);
+      for (const s of tc.shouldContain) {
+        assert.ok(result.includes(s), `expected "${s}" in:\n${result}`);
+      }
+      for (const s of tc.shouldNotContain) {
+        assert.ok(!result.includes(s), `did NOT expect "${s}" in:\n${result}`);
+      }
+    });
+  }
 });
 
 // ── helpers ────────────────────────────────────────────────────────────────

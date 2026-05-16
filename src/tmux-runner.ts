@@ -81,6 +81,28 @@ export function extractResponse(before: string, after: string, prompt: string): 
   return after.trim();
 }
 
+/**
+ * Post-process raw extracted pane text to remove Claude Code TUI chrome:
+ * box drawing borders, role indicator lines (◈ Claude / ◈ Human), and the
+ * bottom input indicator (│ > │ or standalone >).
+ *
+ * Call this after extractResponse() to get clean response text.
+ */
+export function cleanupPaneText(raw: string): string {
+  return raw
+    .split('\n')
+    // Box drawing border lines: lines composed almost entirely of ─ │ ╭ ╰ ╮ ╯ and spaces
+    .filter((l) => !/^[\s╭╰╮╯│─]+$/.test(l))
+    // Role indicator lines: ◈ Claude, ◈ Human, ● Claude, ◉ Human, etc.
+    .filter((l) => !/^[\s◈●◉✦⬡]\s*(Claude|Human|Assistant|User)\s*$/.test(l.trim()))
+    // Input box indicator: │ > │  or  >  alone at end of pane
+    .filter((l) => !/^\s*[│|]?\s*>\s*[│|]?\s*$/.test(l))
+    // Trim trailing whitespace per line (TUI pads to terminal width)
+    .map((l) => l.trimEnd())
+    .join('\n')
+    .trim();
+}
+
 // ── CmdRunner (injectable for tests) ──────────────────────────────────────
 
 export type CmdRunner = (args: string[]) => Promise<{ out: string; code: number }>;
@@ -290,7 +312,7 @@ export class TmuxRunner {
 
       const after = await this.waitUntilStable(sess.name, start, timeoutMs, signal);
 
-      const raw = extractResponse(before, after, prompt);
+      const raw = cleanupPaneText(extractResponse(before, after, prompt));
       const durationMs = Date.now() - start;
       const { text, artifacts } = extractArtifacts(raw);
 
