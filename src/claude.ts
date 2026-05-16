@@ -33,6 +33,12 @@ export interface ClaudeRunResult {
   exitCode: number;
   /** Parsed artifact markers stripped from text (files to attach, URLs to link). */
   artifacts: Artifact[];
+  /** Total tokens in the current context window (input + output + cache). */
+  contextWindowUsed: number;
+  /** Model's max context window size. */
+  contextWindowMax: number;
+  /** Total API cost for this invocation in USD. */
+  costUsd: number;
 }
 
 export class ClaudeError extends Error {
@@ -155,6 +161,14 @@ interface StreamJsonObject {
     role?: string;
     content?: Array<{ type?: string; text?: string }> | string;
   };
+  total_cost_usd?: number;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
+  modelUsage?: Record<string, { contextWindow?: number }>;
 }
 
 function tryParseJson(line: string): StreamJsonObject | null {
@@ -257,6 +271,9 @@ interface ParseAccumulator {
   resultSeen: boolean;
   resultIsError: boolean;
   assistantTextFallback: string;
+  contextWindowUsed: number;
+  contextWindowMax: number;
+  costUsd: number;
 }
 
 function newAccumulator(): ParseAccumulator {
@@ -266,6 +283,9 @@ function newAccumulator(): ParseAccumulator {
     resultSeen: false,
     resultIsError: false,
     assistantTextFallback: '',
+    contextWindowUsed: 0,
+    contextWindowMax: 0,
+    costUsd: 0,
   };
 }
 
@@ -277,6 +297,19 @@ function consumeJsonObject(acc: ParseAccumulator, obj: StreamJsonObject): void {
     acc.resultSeen = true;
     acc.resultIsError = obj.subtype === 'error' || obj.is_error === true;
     if (typeof obj.result === 'string') acc.resultText = obj.result;
+    if (typeof obj.total_cost_usd === 'number') acc.costUsd = obj.total_cost_usd;
+    if (obj.usage) {
+      const u = obj.usage;
+      acc.contextWindowUsed =
+        (u.input_tokens ?? 0) +
+        (u.output_tokens ?? 0) +
+        (u.cache_creation_input_tokens ?? 0) +
+        (u.cache_read_input_tokens ?? 0);
+    }
+    if (obj.modelUsage) {
+      const maxCtx = Math.max(0, ...Object.values(obj.modelUsage).map((m) => m.contextWindow ?? 0));
+      if (maxCtx > 0) acc.contextWindowMax = maxCtx;
+    }
   } else if (obj.type === 'assistant') {
     const t = extractAssistantText(obj);
     if (t) acc.assistantTextFallback += t;
@@ -464,7 +497,16 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
               acc.sessionId = await lookupLatestSessionId(opts.cwd);
             }
             const { text, artifacts } = extractArtifacts(rawText);
-            return { text, sessionId: acc.sessionId, durationMs, exitCode, artifacts };
+            return {
+              text,
+              sessionId: acc.sessionId,
+              durationMs,
+              exitCode,
+              artifacts,
+              contextWindowUsed: acc.contextWindowUsed,
+              contextWindowMax: acc.contextWindowMax,
+              costUsd: acc.costUsd,
+            };
           }
           if (caps.outputMode === 'json') {
             const obj = tryParseJson(stdoutTextBuf) ?? {};
@@ -486,7 +528,7 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
             }
             const sessionId = obj.session_id || (await lookupLatestSessionId(opts.cwd));
             const { text, artifacts } = extractArtifacts(rawText);
-            return { text, sessionId, durationMs, exitCode, artifacts };
+            return { text, sessionId, durationMs, exitCode, artifacts, contextWindowUsed: 0, contextWindowMax: 0, costUsd: 0 };
           }
           // text mode
           const rawText = stdoutTextBuf.trim();
@@ -499,7 +541,7 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
           }
           const sessionId = await lookupLatestSessionId(opts.cwd);
           const { text, artifacts } = extractArtifacts(rawText);
-          return { text, sessionId, durationMs, exitCode, artifacts };
+          return { text, sessionId, durationMs, exitCode, artifacts, contextWindowUsed: 0, contextWindowMax: 0, costUsd: 0 };
         };
 
         finalize().then(

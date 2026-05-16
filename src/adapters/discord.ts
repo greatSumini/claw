@@ -10,6 +10,7 @@ import { runClaude, ClaudeError, snapshotSessionFiles, restoreSessionFiles } fro
 import { runCodex } from '../codex.js';
 import { tmuxRunner, TmuxError } from '../tmux-runner.js';
 import { getSession, upsertSession } from '../state/sessions.js';
+import { logUsage, buildUsageFooter } from '../state/usage.js';
 import { logEvent, searchEvents, type EventSearchResult } from '../state/events.js';
 import { emitEvent } from '../dashboard/event-bus.js';
 import { routeMessage } from '../orchestrator/router.js';
@@ -662,6 +663,9 @@ export class DiscordAdapter implements MessengerAdapter {
             durationMs: tmuxResult.durationMs,
             exitCode: tmuxResult.exitCode,
             artifacts: tmuxResult.artifacts,
+            contextWindowUsed: 0,
+            contextWindowMax: 0,
+            costUsd: 0,
           };
         } else {
           const runner = repo.engine === 'codex' ? runCodex : runClaude;
@@ -704,8 +708,23 @@ export class DiscordAdapter implements MessengerAdapter {
         return;
       }
 
+      // Log usage and build footer.
+      logUsage(this.db, {
+        sessionId: result.sessionId,
+        contextWindowUsed: result.contextWindowUsed,
+        contextWindowMax: result.contextWindowMax,
+        costUsd: result.costUsd,
+      });
+      const usageFooter = buildUsageFooter(this.db, {
+        sessionId: result.sessionId,
+        contextWindowUsed: result.contextWindowUsed,
+        contextWindowMax: result.contextWindowMax,
+        costUsd: result.costUsd,
+      });
+
       // Post the response; capture last sent message ID for memory reference tracking.
       const chunks = splitMessage(result.text, SAFE_CHUNK_SIZE);
+      if (chunks.length > 0) chunks[chunks.length - 1] += '\n' + usageFooter;
       let lastSentMessageId: string | null = null;
       for (let i = 0; i < chunks.length; i++) {
         const isLast = i === chunks.length - 1;
@@ -984,7 +1003,22 @@ export class DiscordAdapter implements MessengerAdapter {
         }
       }
 
+      // Log usage and build footer.
+      logUsage(this.db, {
+        sessionId: result.sessionId,
+        contextWindowUsed: result.contextWindowUsed,
+        contextWindowMax: result.contextWindowMax,
+        costUsd: result.costUsd,
+      });
+      const clawUsageFooter = buildUsageFooter(this.db, {
+        sessionId: result.sessionId,
+        contextWindowUsed: result.contextWindowUsed,
+        contextWindowMax: result.contextWindowMax,
+        costUsd: result.costUsd,
+      });
+
       const chunks = splitMessage(visibleText, SAFE_CHUNK_SIZE);
+      if (chunks.length > 0) chunks[chunks.length - 1] += '\n' + clawUsageFooter;
       let lastSentMsgIdClaw: string | null = null;
       for (let i = 0; i < chunks.length; i++) {
         const isLast = i === chunks.length - 1;

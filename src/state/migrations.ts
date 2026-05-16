@@ -281,6 +281,20 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    name: '015_usage_ledger',
+    sql: `
+      CREATE TABLE IF NOT EXISTS usage_ledger (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts                   TEXT NOT NULL,
+        session_id           TEXT NOT NULL,
+        context_window_used  INTEGER NOT NULL DEFAULT 0,
+        context_window_max   INTEGER NOT NULL DEFAULT 0,
+        cost_usd             REAL NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_usage_ledger_ts ON usage_ledger(ts);
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

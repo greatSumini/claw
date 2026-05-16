@@ -33,6 +33,12 @@ export interface CodexRunResult {
   exitCode: number;
   /** Parsed artifact markers stripped from text (files to attach, URLs to link). */
   artifacts: Artifact[];
+  /** Always 0 — codex does not expose context window usage. */
+  contextWindowUsed: number;
+  /** Always 0 — codex does not expose context window size. */
+  contextWindowMax: number;
+  /** Always 0 — codex does not expose cost. */
+  costUsd: number;
 }
 
 export class CodexError extends Error {
@@ -292,7 +298,7 @@ export function runCodex(opts: CodexRunOptions): Promise<CodexRunResult> {
           }
           const sessionId = acc.sessionId || (await lookupLatestCodexSessionId());
           const { text, artifacts } = extractArtifacts(acc.text);
-          return { text, sessionId, durationMs, exitCode, artifacts };
+          return { text, sessionId, durationMs, exitCode, artifacts, contextWindowUsed: 0, contextWindowMax: 0, costUsd: 0 };
         };
 
         finalize().then(
