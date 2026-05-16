@@ -4,6 +4,7 @@ export { classifyMail } from './importance.js';
 export {
   buildRepoWorkSystemAppend,
   buildClawMaintenanceSystemAppend,
+  buildWikiIngestSystemAppend,
   CLAW_RESTART_MARKER,
 } from './prompt.js';
-export type { RepoWorkPromptArgs, ClawMaintenancePromptArgs } from './prompt.js';
+export type { RepoWorkPromptArgs, ClawMaintenancePromptArgs, WikiIngestPromptArgs } from './prompt.js';

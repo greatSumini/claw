@@ -91,6 +91,30 @@ export interface ClawMaintenancePromptArgs {
 /** 재실행 트리거 마커. claw가 응답에서 이 라인을 검출하면 본문에서 제거 후 launchctl kickstart 수행. */
 export const CLAW_RESTART_MARKER = '__CLAW_RESTART__';
 
+export interface WikiIngestPromptArgs {
+  /** true면 순수 URL ingest, false면 주제어 리서치 */
+  isUrl: boolean;
+}
+
+/**
+ * Build the systemAppend block for a wiki ingest run.
+ * cwd는 ~/coding-agent-wiki. CLAUDE.md를 먼저 읽어 스키마를 확인하고 ingest를 수행한다.
+ */
+export function buildWikiIngestSystemAppend(args: WikiIngestPromptArgs): string {
+  const lines: string[] = [
+    '지시:',
+    '- 한국어로 응답',
+    '- cwd는 ~/coding-agent-wiki. 작업 시작 전 CLAUDE.md를 반드시 읽어 위키 구조·규칙을 확인하라.',
+    args.isUrl
+      ? '- URL Ingest 프로토콜을 따라라: WebFetch → 핵심 추출 → raw/ 저장 → wiki 페이지 생성/업데이트 → _index.md + log.md 갱신'
+      : '- Research 프로토콜을 따라라: WebSearch(3-5개 소스) → WebFetch → 합성 → raw/ 저장 → wiki 페이지 생성/업데이트 → _index.md + log.md 갱신',
+    '- 작업 완료 후 생성/업데이트한 페이지 목록을 한국어로 간결히 요약해서 출력하라.',
+    '- 최종 답변은 핵심만 간결히 (Discord에 그대로 전달됨, 2000자 이상 시 자동 분할됨)',
+    `- ${ARTIFACT_INSTRUCTION}`,
+  ];
+  return lines.join('\n');
+}
+
 /**
  * Build the systemAppend block for a claw self-maintenance run.
  *

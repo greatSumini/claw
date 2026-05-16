@@ -39,6 +39,7 @@ function makeConfig(): AppConfig {
       DASHBOARD_SECRET: 'test-secret-xx',
       DATA_DIR: dataDir,
       LOGS_DIR: path.join(dataDir, 'logs'),
+      WIKI_DIR: path.join(os.tmpdir(), 'coding-agent-wiki'),
     },
     repoChannels: [
       {
@@ -53,6 +54,8 @@ function makeConfig(): AppConfig {
     generalChannelId: GENERAL_CH,
     mailAlertChannelId: REPO_CH,
     clawChannelId: CLAW_CH,
+    wikiChannelId: undefined,
+    wikiDir: path.join(os.tmpdir(), 'coding-agent-wiki'),
     clawRepoPath: '/tmp/repos/claw',
     gmail: [],
     paths: {

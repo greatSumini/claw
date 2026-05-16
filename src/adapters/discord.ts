@@ -17,6 +17,7 @@ import { routeMessage } from '../orchestrator/router.js';
 import {
   buildRepoWorkSystemAppend,
   buildClawMaintenanceSystemAppend,
+  buildWikiIngestSystemAppend,
   buildAnalysisSystemAppend,
   CLAW_RESTART_MARKER,
 } from '../orchestrator/prompt.js';
@@ -518,6 +519,9 @@ export class DiscordAdapter implements MessengerAdapter {
         return;
       case 'claw-maintenance':
         await this.handleClawMaintenance(ctx, threadKey, msgId, channelId);
+        return;
+      case 'wiki-ingest':
+        await this.handleWikiIngest(ctx, threadKey, msgId, channelId);
         return;
       default: {
         // Exhaustiveness guard.
@@ -1116,6 +1120,166 @@ export class DiscordAdapter implements MessengerAdapter {
       if (restart) {
         this.scheduleGracefulRestart(channelLabel, threadKey);
       }
+    } finally {
+      stopTyping();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Wiki ingest flow
+  // -------------------------------------------------------------------------
+
+  private async handleWikiIngest(
+    ctx: MessageContext,
+    threadKey: string,
+    msgId: string,
+    channelId: string,
+  ): Promise<void> {
+    const isThread = ctx.threadId !== null;
+    const isUrl = /^https?:\/\/\S+$/.test(ctx.text.trim());
+
+    let target: TargetChannel;
+    try {
+      if (isThread) {
+        target = { channelId, threadKey };
+      } else {
+        const prefix = isUrl ? 'ingest' : 'research';
+        const title = makeThreadTitle(`${prefix}: ${ctx.text}`);
+        const { threadId: newThreadId } = await this.ipc.discordCreateThread(
+          channelId,
+          msgId,
+          truncate(title, THREAD_NAME_MAX),
+        );
+        target = { channelId: newThreadId, threadKey: newThreadId };
+        threadKey = newThreadId;
+      }
+    } catch (err) {
+      log.error(
+        { err: (err as Error).message, channel: ctx.channelName ?? ctx.channelId },
+        'failed to resolve discord target / open thread (wiki-ingest)',
+      );
+      return;
+    }
+
+    await this.runWithMutex(threadKey, () =>
+      this.runWikiIngestInThread(ctx, target, threadKey, isUrl),
+    );
+  }
+
+  private async runWikiIngestInThread(
+    ctx: MessageContext,
+    target: TargetChannel,
+    threadKey: string,
+    isUrl: boolean,
+  ): Promise<void> {
+    const channelLabel = ctx.channelName ?? ctx.channelId;
+    const wikiDir = this.config.wikiDir;
+
+    const prompt = isUrl
+      ? `다음 URL의 내용을 wiki에 추가해줘:\n\n${ctx.text.trim()}`
+      : `다음 주제를 웹에서 리서치해서 wiki에 추가해줘:\n\n${ctx.text.trim()}`;
+
+    const systemAppend = buildWikiIngestSystemAppend({ isUrl });
+
+    const stopTyping = this.startTyping(target.channelId);
+    try {
+      logEvent(this.db, {
+        type: 'claude.invoke',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `wiki-ingest isUrl=${isUrl}`,
+        meta: { wikiDir, isUrl },
+      });
+      emitEvent({
+        ts: new Date().toISOString(),
+        type: 'claude.invoke',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `wiki-ingest isUrl=${isUrl}`,
+      });
+
+      let result;
+      try {
+        result = await runClaude({
+          cwd: wikiDir,
+          prompt,
+          systemAppend,
+          timeoutMs: CLAUDE_TIMEOUT_MS,
+        });
+      } catch (err) {
+        const e = err instanceof ClaudeError ? err : (err as Error);
+        log.error(
+          { err: e.message, channel: channelLabel, threadId: threadKey },
+          'claude run failed in wiki-ingest',
+        );
+        logEvent(this.db, {
+          type: 'claude.error',
+          channel: channelLabel,
+          threadId: threadKey,
+          summary: e.message.slice(0, 300),
+          meta: { target: 'wiki' },
+        });
+        emitEvent({
+          ts: new Date().toISOString(),
+          type: 'claude.error',
+          channel: channelLabel,
+          threadId: threadKey,
+          summary: e.message.slice(0, 300),
+        });
+        try {
+          await this.safeSend(
+            target.channelId,
+            `wiki ingest 실패: ${truncate(e.message, 1500)}`,
+          );
+        } catch (sendErr) {
+          log.error({ err: (sendErr as Error).message }, 'failed to post error (wiki-ingest)');
+        }
+        return;
+      }
+
+      logUsage(this.db, {
+        sessionId: result.sessionId,
+        contextWindowUsed: result.contextWindowUsed,
+        contextWindowMax: result.contextWindowMax,
+        costUsd: result.costUsd,
+      });
+      const footer = buildUsageFooter(this.db, {
+        sessionId: result.sessionId,
+        contextWindowUsed: result.contextWindowUsed,
+        contextWindowMax: result.contextWindowMax,
+        costUsd: result.costUsd,
+      });
+
+      const chunks = splitMessage(result.text, SAFE_CHUNK_SIZE);
+      if (chunks.length > 0) chunks[chunks.length - 1] += '\n' + footer;
+      for (const chunk of chunks) {
+        try {
+          await this.safeSend(target.channelId, chunk);
+        } catch (err) {
+          log.error(
+            { err: (err as Error).message, channel: channelLabel, threadId: threadKey },
+            'failed to send response chunk (wiki-ingest)',
+          );
+          break;
+        }
+      }
+
+      await this.sendArtifacts(target.channelId, result.artifacts);
+
+      logEvent(this.db, {
+        type: 'claude.result',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `${result.durationMs}ms ${result.text.length}chars`,
+        meta: { duration_seconds: result.durationMs / 1000, target: 'wiki', isUrl },
+      });
+      emitEvent({
+        ts: new Date().toISOString(),
+        type: 'claude.result',
+        channel: channelLabel,
+        threadId: threadKey,
+        summary: `${result.durationMs}ms ${result.text.length}chars`,
+      });
     } finally {
       stopTyping();
     }

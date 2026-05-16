@@ -199,6 +199,18 @@ export async function routeMessage(args: {
     return { kind: 'claw-maintenance' };
   }
 
+  // 2b. wiki ingest 채널 → URL/주제 자동 ingest.
+  if (config.wikiChannelId && ctx.channelId === config.wikiChannelId) {
+    logEvent(db, {
+      type: 'router.classify',
+      channel: ctx.channelId,
+      threadId: ctx.threadId ?? undefined,
+      summary: 'wiki-ingest (channel-locked)',
+      meta: { mode: 'channel-locked', target: 'wiki' },
+    });
+    return { kind: 'wiki-ingest' };
+  }
+
   const isGeneral = ctx.channelId === config.generalChannelId;
   const isDm = ctx.isDm === true;
 

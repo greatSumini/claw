@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { z } from 'zod';
 import path from 'node:path';
+import os from 'node:os';
 import fs from 'node:fs';
 
 const Schema = z.object({
@@ -15,6 +16,10 @@ const Schema = z.object({
   DISCORD_CHANNEL_CLAW: z.string().min(1),
   /** Optional — if absent, mail alerts fall back to DISCORD_CHANNEL_GENERAL */
   DISCORD_CHANNEL_MAIL_ALERTS: z.string().optional(),
+  /** Optional — wiki ingest channel (claw-wiki). If absent, wiki-ingest is disabled. */
+  DISCORD_CHANNEL_WIKI: z.string().optional(),
+  /** Absolute path to the LLM wiki directory. Defaults to ~/coding-agent-wiki */
+  WIKI_DIR: z.string().default(path.resolve(os.homedir(), 'coding-agent-wiki')),
   DISCORD_OWNER_USER_ID: z.string().min(1),
 
   GMAIL_CLIENT_ID: z.string().optional().default(''),
@@ -63,6 +68,10 @@ export interface AppConfig {
   /** Channel where mail alerts are posted (DISCORD_CHANNEL_MAIL_ALERTS or fallback to general) */
   mailAlertChannelId: string;
   clawChannelId: string;
+  /** Channel for wiki ingest (claw-wiki). Undefined if DISCORD_CHANNEL_WIKI not set. */
+  wikiChannelId: string | undefined;
+  /** Absolute path to the LLM wiki directory */
+  wikiDir: string;
   /** Absolute path to this claw repository — derived from process.cwd() at startup */
   clawRepoPath: string;
   gmail: GmailAccount[];
@@ -130,6 +139,8 @@ export function loadConfig(): AppConfig {
     generalChannelId: env.DISCORD_CHANNEL_GENERAL,
     mailAlertChannelId: env.DISCORD_CHANNEL_MAIL_ALERTS ?? env.DISCORD_CHANNEL_GENERAL,
     clawChannelId: env.DISCORD_CHANNEL_CLAW,
+    wikiChannelId: env.DISCORD_CHANNEL_WIKI,
+    wikiDir: env.WIKI_DIR,
     clawRepoPath: process.cwd(),
     gmail,
     paths: {
