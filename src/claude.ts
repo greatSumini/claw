@@ -160,6 +160,12 @@ interface StreamJsonObject {
   message?: {
     role?: string;
     content?: Array<{ type?: string; text?: string }> | string;
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_creation_input_tokens?: number;
+      cache_read_input_tokens?: number;
+    };
   };
   total_cost_usd?: number;
   usage?: {
@@ -298,11 +304,12 @@ function consumeJsonObject(acc: ParseAccumulator, obj: StreamJsonObject): void {
     acc.resultIsError = obj.subtype === 'error' || obj.is_error === true;
     if (typeof obj.result === 'string') acc.resultText = obj.result;
     if (typeof obj.total_cost_usd === 'number') acc.costUsd = obj.total_cost_usd;
-    if (obj.usage) {
+    // result.usage is aggregate across all API sub-calls (tool uses), so only use it
+    // as a fallback when no assistant-level usage was captured.
+    if (acc.contextWindowUsed === 0 && obj.usage) {
       const u = obj.usage;
       acc.contextWindowUsed =
         (u.input_tokens ?? 0) +
-        (u.output_tokens ?? 0) +
         (u.cache_creation_input_tokens ?? 0) +
         (u.cache_read_input_tokens ?? 0);
     }
@@ -313,6 +320,16 @@ function consumeJsonObject(acc: ParseAccumulator, obj: StreamJsonObject): void {
   } else if (obj.type === 'assistant') {
     const t = extractAssistantText(obj);
     if (t) acc.assistantTextFallback += t;
+    // Track the last assistant message's input tokens as the current context window fill.
+    // Each assistant event corresponds to one API call; the last one reflects the actual
+    // context size at the end of the invocation. output_tokens are generated, not "in" the window.
+    if (obj.message?.usage) {
+      const u = obj.message.usage;
+      acc.contextWindowUsed =
+        (u.input_tokens ?? 0) +
+        (u.cache_creation_input_tokens ?? 0) +
+        (u.cache_read_input_tokens ?? 0);
+    }
   }
 }
 
