@@ -714,6 +714,10 @@ export class DiscordAdapter implements MessengerAdapter {
       if (allMemories.length > 0 && lastSentMessageId) {
         try {
           markMemoriesReferenced(this.db, relevantMemories.map((m) => m.id));
+          // Boost Layer 1 candidates that were loaded as context — relevance is itself a quality signal.
+          for (const c of relevantCandidates) {
+            updateCandidateScore(this.db, c.id, 5, threadKey);
+          }
           recordMemoryReferences(
             this.db,
             lastSentMessageId,
@@ -989,6 +993,9 @@ export class DiscordAdapter implements MessengerAdapter {
       if (allMemoriesClaw.length > 0 && lastSentMsgIdClaw) {
         try {
           markMemoriesReferenced(this.db, relevantMemoriesClaw.map((m) => m.id));
+          for (const c of relevantCandidatesClaw) {
+            updateCandidateScore(this.db, c.id, 5, threadKey);
+          }
           recordMemoryReferences(
             this.db,
             lastSentMsgIdClaw,
