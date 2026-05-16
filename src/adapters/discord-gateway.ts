@@ -31,7 +31,6 @@ import {
   deleteQueuedMessage,
 } from '../state/message-queue.js';
 import { splitMessage, truncate, makeThreadTitle } from './discord.js';
-import { IC_INTRO_CHANNEL_ID, loadRoster, handleIcIntro } from './ic-onboarding.js';
 
 // Re-export MailAlertPoster alias for backward compat
 export type { MailAlertPoster as DiscordPoster };
@@ -159,17 +158,6 @@ export class DiscordGatewayAdapter implements MailAlertPoster {
       });
     });
 
-    // Load IC inner circle roster for onboarding handler
-    const contextHubRepo = this.config.repoChannels.find(
-      (r) => r.fullName === 'vibemafiaclub/context-hub',
-    );
-    if (contextHubRepo) {
-      const rosterPath = path.join(
-        contextHubRepo.localPath,
-        'projects/vmc-inner-circle/participants.json',
-      );
-      loadRoster(rosterPath);
-    }
   }
 
   async stop(): Promise<void> {
@@ -196,20 +184,6 @@ export class DiscordGatewayAdapter implements MailAlertPoster {
     if (msg.author?.bot) return;
     if (!this.client.user) return;
     if (msg.author.id === this.client.user.id) return;
-
-    // IC onboarding: process before owner check (open to all guild members)
-    if (msg.channelId === IC_INTRO_CHANNEL_ID) {
-      const member = msg.member;
-      if (member) {
-        await handleIcIntro(
-          member,
-          msg.content ?? '',
-          this.config.clawRepoPath,
-          async (text) => { await msg.reply(text); },
-        );
-      }
-      return;
-    }
 
     const ownerId = this.config.env.DISCORD_OWNER_USER_ID;
     if (msg.author.id !== ownerId) return;
