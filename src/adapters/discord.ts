@@ -305,6 +305,10 @@ export class DiscordAdapter implements MessengerAdapter {
         void this.onIpcButton(msg.customId, msg.channelId, msg.msgId, msg.interactionId, msg.token).catch((err) => {
           log.error({ err: (err as Error).message }, 'discord button interaction handler crashed');
         });
+      } else if (msg.type === 'wiki.scan.trigger') {
+        void this.triggerWikiScan().catch((err) => {
+          log.error({ err: (err as Error).message }, 'wiki.scan.trigger handler crashed');
+        });
       }
     });
     this.startAnalysisPoller();

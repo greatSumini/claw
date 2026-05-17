@@ -65,6 +65,22 @@ async function main(): Promise<void> {
       adapters: { gmail: gmailCount, github: githubCount },
     });
   });
+
+  // Manual trigger for wiki source scan (requires Authorization: Bearer <DASHBOARD_SECRET>)
+  app.post('/admin/wiki-scan', express.json(), (req, res) => {
+    const auth = req.headers['authorization'] ?? '';
+    if (auth !== `Bearer ${config.env.DASHBOARD_SECRET}`) {
+      res.status(401).json({ ok: false, error: 'unauthorized' });
+      return;
+    }
+    if (!config.wikiChannelId) {
+      res.status(400).json({ ok: false, error: 'DISCORD_CHANNEL_WIKI not configured' });
+      return;
+    }
+    ipc.sendToWorker({ type: 'wiki.scan.trigger' });
+    log.info('wiki-scan manually triggered via /admin/wiki-scan');
+    res.json({ ok: true, message: 'wiki-scan triggered' });
+  });
   mountDashboard(app, { db, secret: config.env.DASHBOARD_SECRET });
   const server = app.listen(config.env.DASHBOARD_PORT, () => {
     log.info({ port: config.env.DASHBOARD_PORT }, 'dashboard listening');
