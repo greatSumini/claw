@@ -190,7 +190,7 @@ export class DiscordGatewayAdapter implements MailAlertPoster {
     if (msg.author.id === this.client.user.id) return;
 
     const ownerId = this.config.env.DISCORD_OWNER_USER_ID;
-    if (msg.author.id !== ownerId) return;
+    if (msg.author.id !== ownerId && !this.isAllowedUser(msg)) return;
 
     const ctx = this.buildContext(msg);
     const channel = msg.channel;
@@ -246,6 +246,19 @@ export class DiscordGatewayAdapter implements MailAlertPoster {
       interactionId: interaction.id,
       token: interaction.token,
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Allowlist check — true if the message author is permitted for this channel
+  // -------------------------------------------------------------------------
+
+  private isAllowedUser(msg: Message): boolean {
+    const channel = msg.channel;
+    const routingChannelId = channel.isThread()
+      ? (channel.parentId ?? channel.id)
+      : channel.id;
+    const repo = this.config.repoChannels.find((r) => r.channelId === routingChannelId);
+    return repo?.allowedUserIds?.includes(msg.author.id) ?? false;
   }
 
   // -------------------------------------------------------------------------

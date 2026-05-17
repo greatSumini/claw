@@ -53,6 +53,8 @@ export interface RepoEntry {
   watchPrs?: boolean;
   /** Automatically attempt to resolve simple issues via Claude Code (branch → PR). */
   autoSolveIssues?: boolean;
+  /** Discord user IDs (besides the owner) allowed to send messages in this channel. */
+  allowedUserIds?: string[];
 }
 
 export interface GmailAccount {
@@ -95,6 +97,7 @@ const RepoEntryConfigSchema = z.object({
   watchIssues: z.boolean().optional(),
   watchPrs: z.boolean().optional(),
   autoSolveIssues: z.boolean().optional(),
+  allowedUserIds: z.array(z.string()).optional(),
 });
 
 const GmailAccountConfigSchema = z.object({
