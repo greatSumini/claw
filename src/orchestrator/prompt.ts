@@ -108,11 +108,30 @@ export function buildWikiIngestSystemAppend(args: WikiIngestPromptArgs): string 
     args.isUrl
       ? '- URL Ingest 프로토콜을 따라라: WebFetch → 핵심 추출 → raw/ 저장 → wiki 페이지 생성/업데이트 → _index.md + log.md 갱신'
       : '- Research 프로토콜을 따라라: WebSearch(3-5개 소스) → WebFetch → 합성 → raw/ 저장 → wiki 페이지 생성/업데이트 → _index.md + log.md 갱신',
+    '- 스레드 컨텍스트에 "📚 Wiki 신규 지식 후보" 브리핑이 있고 사용자가 번호(예: "1, 3")나 "전부"로 선택하면: 해당 번호의 URL을 찾아 각각 URL Ingest 프로토콜로 순서대로 처리하고, 완료 후 "N개 항목을 wiki에 추가했습니다" 요약.',
     '- 작업 완료 후 생성/업데이트한 페이지 목록을 한국어로 간결히 요약해서 출력하라.',
     '- 최종 답변은 핵심만 간결히 (Discord에 그대로 전달됨, 2000자 이상 시 자동 분할됨)',
     `- ${ARTIFACT_INSTRUCTION}`,
   ];
   return lines.join('\n');
+}
+
+/**
+ * Build the systemAppend block for a wiki source scan run.
+ * sourcesPath는 wiki-sources.json의 절대 경로.
+ * Claude가 소스를 fetch하고 wiki 후보를 번호 목록으로 보고한다.
+ */
+export function buildWikiScanSystemAppend(sourcesPath: string): string {
+  return [
+    '지시:',
+    '- 한국어로 응답',
+    `- ${sourcesPath} 파일을 읽어 소스 목록을 가져온다.`,
+    '- 소스가 비어있으면 "등록된 소스가 없습니다. data/wiki-sources.json에 소스를 추가해주세요." 만 출력하고 종료.',
+    '- 각 소스의 RSS/URL에서 최근 7일 이내 신규 컨텐츠를 탐색한다 (WebFetch 사용). RSS feed URL이 있으면 우선 시도.',
+    '- wiki에 추가할 가치가 있는 상위 5~10개 항목을 선정한다 (독창적 인사이트, 실용적 지식, 최신 트렌드 기준).',
+    '- 다음 형식으로 보고한다 (항목이 없으면 "최근 7일 내 신규 항목이 없습니다." 출력):\n\n## 📚 Wiki 신규 지식 후보 — {오늘날짜}\n**탐색 소스**: N개 | **신규 항목**: M개\n\n### 1. [제목]\n- 🔗 URL\n- 📅 날짜\n- **소스**: 소스명\n- **추천 이유**: 한 줄\n- **요약**: 2~3문장\n\n### 2. ...\n\n---\n> wiki에 적재할 항목을 이 스레드에 번호로 알려주세요 (예: "1, 3 인제스트" / "전부다" / "패스")',
+    '- 최종 답변은 핵심만 간결히 (Discord에 그대로 전달됨, 2000자 이상 시 자동 분할됨)',
+  ].join('\n');
 }
 
 /**

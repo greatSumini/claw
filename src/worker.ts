@@ -5,6 +5,7 @@ import { log } from './log.js';
 import { getDb, closeDb } from './state/db.js';
 import { WorkerIpc } from './ipc/client.js';
 import { DiscordAdapter } from './adapters/discord.js';
+import { WikiScanScheduler } from './scheduler/wiki-scan.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -19,8 +20,13 @@ async function main(): Promise<void> {
   const discord = new DiscordAdapter({ config, db, ipc });
   discord.start();
 
+  // Wiki source scan: daily briefing to claw-wiki channel (runs in worker to access Claude)
+  const wikiScan = new WikiScanScheduler(config, () => discord.triggerWikiScan());
+  wikiScan.start();
+
   process.on('SIGTERM', () => {
     log.info('worker SIGTERM — stopping');
+    wikiScan.stop();
     void discord.stop().catch(() => {});
     closeDb();
     ipc.destroy();

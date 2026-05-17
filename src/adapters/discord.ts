@@ -18,6 +18,7 @@ import {
   buildRepoWorkSystemAppend,
   buildClawMaintenanceSystemAppend,
   buildWikiIngestSystemAppend,
+  buildWikiScanSystemAppend,
   buildAnalysisSystemAppend,
   CLAW_RESTART_MARKER,
 } from '../orchestrator/prompt.js';
@@ -1278,6 +1279,112 @@ export class DiscordAdapter implements MessengerAdapter {
         type: 'claude.result',
         channel: channelLabel,
         threadId: threadKey,
+        summary: `${result.durationMs}ms ${result.text.length}chars`,
+      });
+    } finally {
+      stopTyping();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Wiki source scan — daily briefing to claw-wiki channel
+  // -------------------------------------------------------------------------
+
+  /** Public: called by WikiScanScheduler (runs in worker process) */
+  async triggerWikiScan(): Promise<void> {
+    const channelId = this.config.wikiChannelId;
+    if (!channelId) return;
+    await this.handleWikiScan(channelId);
+  }
+
+  private async handleWikiScan(channelId: string): Promise<void> {
+    const sourcesPath = path.join(this.config.clawRepoPath, 'data', 'wiki-sources.json');
+    const today = new Date().toLocaleDateString('ko-KR', {
+      timeZone: 'Asia/Seoul',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+
+    // Post trigger message → create thread
+    let threadId: string;
+    try {
+      const { messageId } = await this.ipc.discordSend(channelId, `📡 **wiki 소스 스캔** — ${today}`);
+      if (!messageId) throw new Error('messageId missing');
+      const result = await this.ipc.discordCreateThread(channelId, messageId, `wiki-scan: ${today}`);
+      threadId = result.threadId;
+    } catch (err) {
+      log.error({ err: (err as Error).message }, 'wiki-scan: failed to create thread');
+      return;
+    }
+
+    const systemAppend = buildWikiScanSystemAppend(sourcesPath);
+    const prompt = '등록된 wiki 소스들에서 오늘의 신규 지식 후보를 탐색하고 보고해줘.';
+
+    const stopTyping = this.startTyping(threadId);
+    try {
+      logEvent(this.db, {
+        type: 'claude.invoke',
+        channel: 'wiki-scan',
+        threadId,
+        summary: 'wiki-scan daily',
+        meta: { sourcesPath },
+      });
+      emitEvent({
+        ts: new Date().toISOString(),
+        type: 'claude.invoke',
+        channel: 'wiki-scan',
+        threadId,
+        summary: 'wiki-scan daily',
+      });
+
+      let result;
+      try {
+        result = await runClaude({
+          cwd: this.config.paths.dataDir,
+          prompt,
+          systemAppend,
+          timeoutMs: CLAUDE_TIMEOUT_MS,
+        });
+      } catch (err) {
+        const e = err instanceof ClaudeError ? err : (err as Error);
+        log.error({ err: e.message }, 'wiki-scan: claude run failed');
+        await this.safeSend(threadId, `❌ wiki 스캔 실패: ${truncate(e.message, 1500)}`);
+        return;
+      }
+
+      logUsage(this.db, {
+        sessionId: result.sessionId,
+        contextWindowUsed: result.contextWindowUsed,
+        contextWindowMax: result.contextWindowMax,
+        costUsd: result.costUsd,
+      });
+      const footer = buildUsageFooter(this.db, {
+        sessionId: result.sessionId,
+        contextWindowUsed: result.contextWindowUsed,
+        contextWindowMax: result.contextWindowMax,
+        costUsd: result.costUsd,
+      });
+
+      const chunks = splitMessage(result.text, SAFE_CHUNK_SIZE);
+      if (chunks.length > 0) chunks[chunks.length - 1] += '\n' + footer;
+      for (const chunk of chunks) {
+        await this.safeSend(threadId, chunk);
+      }
+      await this.sendArtifacts(threadId, result.artifacts);
+
+      logEvent(this.db, {
+        type: 'claude.result',
+        channel: 'wiki-scan',
+        threadId,
+        summary: `${result.durationMs}ms ${result.text.length}chars`,
+        meta: { duration_seconds: result.durationMs / 1000 },
+      });
+      emitEvent({
+        ts: new Date().toISOString(),
+        type: 'claude.result',
+        channel: 'wiki-scan',
+        threadId,
         summary: `${result.durationMs}ms ${result.text.length}chars`,
       });
     } finally {
