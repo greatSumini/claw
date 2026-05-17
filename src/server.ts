@@ -17,6 +17,7 @@ import { GmailAdapter } from './adapters/gmail.js';
 import { GitHubIssueAdapter } from './adapters/github.js';
 import { RepoSyncScheduler } from './scheduler/repo-sync.js';
 import { DreamingScheduler } from './scheduler/dreaming.js';
+import { WikiScanScheduler } from './scheduler/wiki-scan.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const execFileAsync = promisify(execFile);
@@ -77,7 +78,9 @@ async function main(): Promise<void> {
       res.status(400).json({ ok: false, error: 'DISCORD_CHANNEL_WIKI not configured' });
       return;
     }
-    ipc.sendToWorker({ type: 'wiki.scan.trigger' });
+    void discord.triggerWikiScan().catch((err) => {
+      log.error({ err: (err as Error).message }, 'wiki-scan trigger failed');
+    });
     log.info('wiki-scan manually triggered via /admin/wiki-scan');
     res.json({ ok: true, message: 'wiki-scan triggered' });
   });
@@ -112,6 +115,10 @@ async function main(): Promise<void> {
     discord.postToChannel(config.clawChannelId, msg),
   );
   dreaming.start();
+
+  // Wiki scan: daily source briefing to claw-wiki channel (runs in Gateway to survive Worker restart)
+  const wikiScan = new WikiScanScheduler(config, () => discord.triggerWikiScan());
+  wikiScan.start();
 
   // Gmail (optional — only if configured)
   let gmail: GmailAdapter | null = null;
@@ -158,6 +165,7 @@ async function main(): Promise<void> {
       server.close();
       repoSync.stop();
       dreaming.stop();
+      wikiScan.stop();
       await discord.stop();
       if (gmail) await gmail.stop();
       github.stop();

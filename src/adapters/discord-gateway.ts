@@ -23,6 +23,7 @@ import type Database from 'better-sqlite3';
 
 import type { AppConfig } from '../config.js';
 import { log } from '../log.js';
+import { runClaude, ClaudeError } from '../claude.js';
 import { GatewayIpc } from '../ipc/server.js';
 import type { W2G, SerializedMessage } from '../ipc/types.js';
 import type { MailAlertPoster } from '../messenger/types.js';
@@ -30,6 +31,9 @@ import {
   getPendingMessages,
   deleteQueuedMessage,
 } from '../state/message-queue.js';
+import { logEvent } from '../state/events.js';
+import { logUsage, buildUsageFooter } from '../state/usage.js';
+import { buildWikiScanSystemAppend } from '../orchestrator/prompt.js';
 import { splitMessage, truncate, makeThreadTitle } from './discord.js';
 
 // Re-export MailAlertPoster alias for backward compat
@@ -630,6 +634,131 @@ export class DiscordGatewayAdapter implements MailAlertPoster {
   }
 
   // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // triggerWikiScan — Gateway-side wiki source scan (survives Worker restart)
+  // -------------------------------------------------------------------------
+
+  async triggerWikiScan(): Promise<void> {
+    const channelId = this.config.wikiChannelId;
+    if (!channelId) return;
+
+    const sourcesPath = path.join(this.config.clawRepoPath, 'data', 'wiki-sources.json');
+    const today = new Date().toLocaleDateString('ko-KR', {
+      timeZone: 'Asia/Seoul',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+
+    // Post initial message and create thread
+    let thread: { id: string; send: (c: string) => Promise<unknown> };
+    try {
+      const channel = await this.client.channels.fetch(channelId);
+      if (!channel || !channel.isTextBased() || !('send' in channel)) {
+        log.error({ channelId }, 'wiki-scan: channel not found or not text-based');
+        return;
+      }
+      const msg = await (channel as { send: (c: string) => Promise<Message> }).send(
+        `📡 **wiki 소스 스캔** — ${today}`,
+      );
+      thread = await msg.startThread({
+        name: truncate(`wiki-scan: ${today}`, THREAD_NAME_MAX),
+        autoArchiveDuration: DEFAULT_AUTO_ARCHIVE_MIN,
+      }) as typeof thread;
+    } catch (err) {
+      log.error({ err: (err as Error).message }, 'wiki-scan: failed to create thread');
+      return;
+    }
+
+    const threadId = thread.id;
+    const systemAppend = buildWikiScanSystemAppend(sourcesPath);
+    const prompt = '등록된 wiki 소스들에서 오늘의 신규 지식 후보를 탐색하고 보고해줘.';
+
+    const stopTyping = this.startGatewayTyping(threadId);
+    try {
+      logEvent(this.db, {
+        type: 'claude.invoke',
+        channel: 'wiki-scan',
+        threadId,
+        summary: 'wiki-scan daily',
+        meta: { sourcesPath },
+      });
+
+      let result;
+      try {
+        result = await runClaude({
+          cwd: this.config.paths.dataDir,
+          prompt,
+          systemAppend,
+          timeoutMs: 10 * 60 * 1000,
+        });
+      } catch (err) {
+        const e = err instanceof ClaudeError ? err : (err as Error);
+        log.error({ err: e.message }, 'wiki-scan: claude run failed');
+        await thread.send(`❌ wiki 스캔 실패: ${e.message.slice(0, 1500)}`);
+        return;
+      }
+
+      logUsage(this.db, {
+        sessionId: result.sessionId,
+        contextWindowUsed: result.contextWindowUsed,
+        contextWindowMax: result.contextWindowMax,
+        costUsd: result.costUsd,
+      });
+      const footer = buildUsageFooter(this.db, {
+        sessionId: result.sessionId,
+        contextWindowUsed: result.contextWindowUsed,
+        contextWindowMax: result.contextWindowMax,
+        costUsd: result.costUsd,
+      });
+
+      const chunks = splitMessage(result.text, SAFE_CHUNK_SIZE);
+      if (chunks.length > 0) chunks[chunks.length - 1] += '\n' + footer;
+      for (const chunk of chunks) {
+        await thread.send(chunk);
+      }
+
+      logEvent(this.db, {
+        type: 'claude.result',
+        channel: 'wiki-scan',
+        threadId,
+        summary: `${result.durationMs}ms ${result.text.length}chars`,
+        meta: { duration_seconds: result.durationMs / 1000 },
+      });
+    } finally {
+      stopTyping();
+    }
+  }
+
+  private startGatewayTyping(channelId: string): () => void {
+    const existing = this.typingLoops.get(channelId);
+    if (existing) existing();
+
+    let cancelled = false;
+    let timer: NodeJS.Timeout | null = null;
+
+    const fire = (): void => {
+      if (cancelled) return;
+      void this.client.channels.fetch(channelId).then((ch) => {
+        if (cancelled || !ch || !('sendTyping' in ch)) return;
+        return (ch as { sendTyping: () => Promise<void> }).sendTyping();
+      }).catch(() => {});
+      if (cancelled) return;
+      timer = setTimeout(fire, TYPING_REFRESH_MS);
+      if (timer && typeof timer.unref === 'function') timer.unref();
+    };
+
+    const cleanup = (): void => {
+      cancelled = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      this.typingLoops.delete(channelId);
+    };
+
+    this.typingLoops.set(channelId, cleanup);
+    fire();
+    return cleanup;
+  }
+
   // postToChannel — simple one-shot message (used by repo-sync / dreaming)
   // -------------------------------------------------------------------------
 

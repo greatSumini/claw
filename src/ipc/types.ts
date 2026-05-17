@@ -26,8 +26,7 @@ export interface SerializedMessage {
 export type G2WEvent =
   | { type: 'discord.message'; ctx: MessageContext; threadKey: string; msgId: string; channelId: string }
   | { type: 'discord.reaction'; emoji: string; msgId: string; channelId: string; userId: string; isOwner: boolean }
-  | { type: 'discord.button'; customId: string; channelId: string; msgId: string; interactionId: string; token: string }
-  | { type: 'wiki.scan.trigger' };
+  | { type: 'discord.button'; customId: string; channelId: string; msgId: string; interactionId: string; token: string };
 
 /** Gateway → Worker: responses to requests */
 export type G2WResponse =
